@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="accent">#3482FF</color>
+    <color name="caption_bg">#E6FFFFFF</color>
+    <color name="bubble_bg">#F2FFFFFF</color>
+</resources>

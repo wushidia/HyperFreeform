@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string-array name="xposed_scope">
+        <item>android</item>
+        <item>com.android.systemui</item>
+        <item>io.hyper.freeform</item>
+        <!-- Lawnchair on MuMu; AOSP Quickstep launcher package if present -->
+        <item>app.lawnchair</item>
+        <item>com.android.launcher3</item>
+    </string-array>
+</resources>

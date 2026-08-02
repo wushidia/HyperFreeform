@@ -1,0 +1,6 @@
+# Copy this file to signing.properties and replace every placeholder locally.
+# signing.properties and common keystore formats are excluded by .gitignore.
+storeFile=release-key.jks
+storePassword=replace-me
+keyAlias=replace-me
+keyPassword=replace-me

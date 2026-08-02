@@ -1,0 +1,31 @@
+# Android Studio and local SDK configuration
+.idea/
+*.iml
+local.properties
+
+# Local signing material (never commit private keys or credentials)
+signing.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+
+# Gradle and Kotlin caches
+.gradle/
+.kotlin/
+**/build/
+
+# Native/build tooling
+.externalNativeBuild/
+.cxx/
+captures/
+
+# Packaged artifacts and local OS files
+*.apk
+*.aab
+*.ap_
+.DS_Store
+Thumbs.db
+*:Zone.Identifier

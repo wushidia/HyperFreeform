@@ -1,0 +1,4 @@
+-keep class io.hyper.freeform.xposed.** { *; }
+-keep class io.hyper.freeform.provider.ModuleStatusProvider { *; }
+-keep class io.hyper.freeform.provider.ModuleStatusProvider$Companion { *; }
+-keep class de.robv.android.xposed.** { *; }

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Monochrome status-bar form of the launcher icon. Android supplies the final tint. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M7.5,2.5H16.5C19.26,2.5 21.5,4.74 21.5,7.5V16.5C21.5,19.26 19.26,21.5 16.5,21.5H7.5C4.74,21.5 2.5,19.26 2.5,16.5V7.5C2.5,4.74 4.74,2.5 7.5,2.5ZM8,6H16C17.1,6 18,6.9 18,8V16C18,17.1 17.1,18 16,18H8C6.9,18 6,17.1 6,16V8C6,6.9 6.9,6 8,6Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M10.75,8.75H13.25C14.35,8.75 15.25,9.65 15.25,10.75V13.25C15.25,14.35 14.35,15.25 13.25,15.25H10.75C9.65,15.25 8.75,14.35 8.75,13.25V10.75C8.75,9.65 9.65,8.75 10.75,8.75ZM11,10.5H13C13.28,10.5 13.5,10.72 13.5,11V13C13.5,13.28 13.28,13.5 13,13.5H11C10.72,13.5 10.5,13.28 10.5,13V11C10.5,10.72 10.72,10.5 11,10.5Z" />
+</vector>
