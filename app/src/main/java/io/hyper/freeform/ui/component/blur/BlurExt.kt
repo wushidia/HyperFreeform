@@ -48,15 +48,18 @@ fun rememberBlurBackdrop(enabled: Boolean = LocalBlurEnabled.current): LayerBack
 @Composable
 fun BlurredBar(
     backdrop: LayerBackdrop?,
+    modifier: Modifier = Modifier,
     blurActive: Boolean = rememberBlurEnabled().value,
     content: @Composable () -> Unit,
 ) {
     Box(
-        modifier = if (blurActive && backdrop != null) {
-            Modifier.defaultBlurEffect(backdrop)
-        } else {
-            Modifier
-        },
+        modifier = modifier.then(
+            if (blurActive && backdrop != null) {
+                Modifier.defaultBlurEffect(backdrop)
+            } else {
+                Modifier
+            },
+        ),
     ) {
         content()
     }

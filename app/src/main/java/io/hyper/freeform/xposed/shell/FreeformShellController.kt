@@ -200,6 +200,7 @@ class FreeformShellController {
                 x = bounds.left
                 y = bounds.top
                 title = "HyperFreeformLaunchSplash-${this@LaunchSplashSession.packageName}"
+                SystemServices.applyOverlaySystemUiPassthrough(this)
                 runCatching { javaClass.getMethod("setTrustedOverlay").invoke(this) }
                     .recoverCatching {
                         val field = javaClass.getField("privateFlags")
@@ -604,6 +605,7 @@ class FreeformShellController {
             ).apply {
                 gravity = Gravity.TOP or Gravity.START
                 title = "HyperFreeformCaption-${state.taskId}"
+                SystemServices.applyOverlaySystemUiPassthrough(this)
                 markTrustedOverlay(this)
             }
         }
@@ -1020,6 +1022,7 @@ class FreeformShellController {
             ).apply {
                 gravity = Gravity.TOP or Gravity.START
                 title = "HyperFreeformHandleMenu-${state.taskId}"
+                SystemServices.applyOverlaySystemUiPassthrough(this)
             }
             handleMenuLp = lp
             runCatching {
@@ -1095,6 +1098,7 @@ class FreeformShellController {
                 x = 0
                 y = 0
                 title = "HyperFreeformHotArea-${state.taskId}"
+                SystemServices.applyOverlaySystemUiPassthrough(this)
             }
             hotIndicatorLp = lp
             runCatching {
@@ -1203,6 +1207,7 @@ class FreeformShellController {
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             title = "HyperFreeformBubble-${state.taskId}"
+            SystemServices.applyOverlaySystemUiPassthrough(this)
         }
         private var attached = false
         private var downX = 0f

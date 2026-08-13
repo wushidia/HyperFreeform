@@ -51,6 +51,13 @@ object FreeformPolicy {
 
     /** Fallback only; runtime reads the active SystemUI freeform radius. */
     const val FREEFORM_CORNER_DP = 18f
+    /** Floor so a square-corner ROM still gets a readable freeform silhouette. */
+    const val MIN_FREEFORM_CORNER_DP = 12f
+    /**
+     * Display-panel radii above this are bezels, not window radii. Using them raw makes a small
+     * window look like a pill.
+     */
+    private const val MAX_WINDOW_CORNER_DP = 28f
     const val MINI_CORNER_DP = 12f
     /** Xiaomi floating_window edge peek (only ~24dp remains on-screen) */
     const val BUBBLE_PEEK_DP = 24
@@ -470,7 +477,8 @@ object FreeformPolicy {
     /**
      * Xiaomi freeform landscape (MiuiFreeFormActivityStack.mIsLandcapeFreeform):
      * when the app inside requests landscape, the freeform window itself rotates to a
-     * landscape rectangle (16:9-ish) instead of the app being refused as split-screen.
+     * landscape rectangle using the reciprocal of its configured portrait aspect instead of
+     * imposing 16:9 or the physical display ratio.
      * Keeps the visual center of [portrait] where possible, clamped on-screen.
      */
     fun landscapeBoundsFor(
@@ -478,18 +486,38 @@ object FreeformPolicy {
         context: Context = SystemServices.systemContext,
     ): Rect {
         val (dw, dh) = displaySize(context)
-        // Landscape freeform ~ 82% of the shorter screen edge wide, 16:9 tall.
-        val w = (minOf(dw, dh) * 0.86f).toInt()
-            .coerceAtLeast(dp(context, 320))
-            .coerceAtMost(dw - dp(context, 16))
-        val h = (w * 9f / 16f).toInt()
-            .coerceAtLeast(dp(context, 180))
-            .coerceAtMost(dh - dp(context, 80))
+        val landscapeAspect = portrait.height().coerceAtLeast(1).toFloat() /
+            portrait.width().coerceAtLeast(1)
+        val maxW = (dw - dp(context, 16)).coerceAtLeast(1)
+        val maxH = (dh - dp(context, 80)).coerceAtLeast(1)
+        var w = (minOf(dw, dh) * 0.86f).toInt().coerceAtMost(maxW)
+        var h = (w / landscapeAspect).roundToInt().coerceAtLeast(1)
+        if (h > maxH) {
+            h = maxH
+            w = (h * landscapeAspect).roundToInt().coerceAtMost(maxW)
+        }
         val cx = if (portrait.width() > 0) portrait.exactCenterX() else dw / 2f
         val cy = if (portrait.height() > 0) portrait.exactCenterY() else dh / 2.4f
         val left = (cx - w / 2f).toInt()
         val top = (cy - h / 2f).toInt()
         return clampBounds(Rect(left, top, left + w, top + h), context)
+    }
+
+    /**
+     * Large app-render source for landscape-player UI. It has exactly the same aspect as the
+     * landscape visual frame, while its short edge uses the display's short edge for a full-size
+     * resource/layout class. This avoids scaling a device-ratio source into a user-ratio mask.
+     */
+    fun landscapeSourceBoundsFor(
+        portrait: Rect,
+        context: Context = SystemServices.systemContext,
+    ): Rect {
+        val (dw, dh) = displaySize(context)
+        val shortEdge = minOf(dw, dh).coerceAtLeast(1)
+        val landscapeAspect = portrait.height().coerceAtLeast(1).toFloat() /
+            portrait.width().coerceAtLeast(1)
+        val width = (shortEdge * landscapeAspect).roundToInt().coerceAtLeast(1)
+        return Rect(0, 0, width, shortEdge)
     }
 
     /**
@@ -622,6 +650,100 @@ object FreeformPolicy {
     const val SPRING_PIN_DAMPING = 0.9f
     const val SPRING_PIN_RESPONSE = 0.35f
 
+    // --- MIUI MultiTaskingEaseManager transition springs (systemui multitasking) ---
+    /** DEFAULT_EASE = spring(0.95, 0.35): normal→mini shrink (applyFreeformToMiniAnimation). */
+    const val SPRING_DEFAULT_DAMPING = 0.95f
+    const val SPRING_DEFAULT_RESPONSE = 0.35f
+    /** TO_FREEFORM_POSITION_SIZE_EASE = spring(0.95, 0.4): bubble/unpin restore. */
+    const val SPRING_TO_FREEFORM_DAMPING = 0.95f
+    const val SPRING_TO_FREEFORM_RESPONSE = 0.4f
+    /**
+     * FREEFORM_DRAG_TO_FULLSCREEN_*: maximize sweep.
+     * Position spring(0.95, 0.4), size spring(0.95, 0.38) — MIUI animates them separately.
+     */
+    const val SPRING_MAXIMIZE_POS_DAMPING = 0.95f
+    const val SPRING_MAXIMIZE_POS_RESPONSE = 0.4f
+    const val SPRING_MAXIMIZE_SIZE_DAMPING = 0.95f
+    const val SPRING_MAXIMIZE_SIZE_RESPONSE = 0.38f
+    /** TO_FULLSCREEN_SPLIT_*: freeform→split. Position spring(0.85, 0.55), size spring(0.9, 0.48). */
+    const val SPRING_SPLIT_POS_DAMPING = 0.85f
+    const val SPRING_SPLIT_POS_RESPONSE = 0.55f
+    const val SPRING_SPLIT_SIZE_DAMPING = 0.9f
+    const val SPRING_SPLIT_SIZE_RESPONSE = 0.48f
+    /** ROTATE_POSITION_Z_EASE = spring(0.95, 0.42): portrait/landscape orientation sweep. */
+    const val SPRING_ROTATE_DAMPING = 0.95f
+    const val SPRING_ROTATE_RESPONSE = 0.42f
+    /** PIN_POSITION_EASE = spring(0.78, 0.6) / PIN_WIDTH_HEIGHT_EASE = spring(1.0, 0.35). */
+    const val SPRING_PIN_POS_DAMPING = 0.78f
+    const val SPRING_PIN_POS_RESPONSE = 0.6f
+    const val SPRING_PIN_SIZE_DAMPING = 1.0f
+    const val SPRING_PIN_SIZE_RESPONSE = 0.35f
+
+    /** Fixed-window durations for the closed-form spring approximations (settle ≈ 2 periods). */
+    const val MINI_ENTER_ANIM_MS = 330L
+    const val UNPIN_ANIM_MS = 360L
+    const val MAXIMIZE_ANIM_MS = 300L
+    const val SPLIT_ANIM_MS = 380L
+    const val ROTATE_ANIM_MS = 350L
+    const val OPEN_ANIM_MS = 300L
+
+    /**
+     * Dual-spring transition frame (MIUI animates position and size with separate eases):
+     * the frame CENTER follows [posP], WIDTH/HEIGHT/alpha follow [sizeP].
+     */
+    fun transitionVisualFrame(
+        from: Rect,
+        to: Rect,
+        posP: Float,
+        sizeP: Float,
+        alphaFrom: Float = 1f,
+        alphaTo: Float = 1f,
+    ): WindowVisualFrame {
+        val pp = posP.coerceIn(0f, 1.15f)
+        val sp = sizeP.coerceIn(0f, 1.15f)
+        val cx = from.exactCenterX() + (to.exactCenterX() - from.exactCenterX()) * pp
+        val cy = from.exactCenterY() + (to.exactCenterY() - from.exactCenterY()) * pp
+        val w = (from.width() + (to.width() - from.width()) * sp).coerceAtLeast(1f)
+        val h = (from.height() + (to.height() - from.height()) * sp).coerceAtLeast(1f)
+        return WindowVisualFrame(
+            left = cx - w / 2f,
+            top = cy - h / 2f,
+            width = w,
+            height = h,
+            alpha = (alphaFrom + (alphaTo - alphaFrom) * sp).coerceIn(0f, 1f),
+        )
+    }
+
+    /**
+     * Fullscreen-leash settle frame used after WM has already committed fullscreen geometry.
+     * Start from a centered, aspect-preserving cover of the old freeform card, then reveal the
+     * complete fullscreen buffer while the spring lands. Content is never non-uniformly stretched.
+     */
+    fun maximizeFullscreenFrame(
+        from: Rect,
+        fullscreen: Rect,
+        posProgress: Float,
+        sizeProgress: Float,
+    ): WindowVisualFrame {
+        val pp = posProgress.coerceIn(0f, 1f)
+        val sp = sizeProgress.coerceIn(0f, 1f)
+        val centerX = from.exactCenterX() +
+            (fullscreen.exactCenterX() - from.exactCenterX()) * pp
+        val centerY = from.exactCenterY() +
+            (fullscreen.exactCenterY() - from.exactCenterY()) * pp
+        val width = from.width().coerceAtLeast(1) +
+            (fullscreen.width() - from.width()) * sp
+        val height = from.height().coerceAtLeast(1) +
+            (fullscreen.height() - from.height()) * sp
+        return WindowVisualFrame(
+            left = centerX - width / 2f,
+            top = centerY - height / 2f,
+            width = width,
+            height = height,
+            alpha = 1f,
+        )
+    }
+
     fun openVisualFrame(bounds: Rect, progress: Float): WindowVisualFrame {
         val p = progress.coerceIn(0f, 1f)
         val scale = 0.86f + 0.14f * p
@@ -654,9 +776,13 @@ object FreeformPolicy {
         sourceBounds: Rect,
         visualBounds: Rect,
         pinPos: Int,
-        progress: Float,
+        posProgress: Float,
+        sizeProgress: Float = posProgress,
     ): WindowVisualFrame {
-        val p = progress.coerceIn(0f, 1f)
+        // MIUI pin animates position (spring 0.78/0.6) and width/height (spring 1.0/0.35)
+        // as separate properties, so the window settles at the edge before fully shrinking.
+        val p = sizeProgress.coerceIn(0f, 1.15f)
+        val pp = posProgress.coerceIn(0f, 1.15f)
         val srcW = sourceBounds.width().coerceAtLeast(1).toFloat()
         val srcH = sourceBounds.height().coerceAtLeast(1).toFloat()
         val startScale = (visualBounds.width().coerceAtLeast(1) / srcW).coerceIn(0.1f, 1.5f)
@@ -674,9 +800,9 @@ object FreeformPolicy {
         val targetCenterY = visualBounds.top.toFloat()
             .coerceIn(80f, (displayH - bubble - 80f).coerceAtLeast(80f)) + bubble / 2f
         val centerX = visualBounds.exactCenterX() +
-            (targetCenterX - visualBounds.exactCenterX()) * p
+            (targetCenterX - visualBounds.exactCenterX()) * pp
         val centerY = visualBounds.exactCenterY() +
-            (targetCenterY - visualBounds.exactCenterY()) * p
+            (targetCenterY - visualBounds.exactCenterY()) * pp
         val width = srcW * scale
         val height = srcH * scale
         return WindowVisualFrame(
@@ -684,7 +810,7 @@ object FreeformPolicy {
             top = centerY - height / 2f,
             width = width,
             height = height,
-            alpha = (1f - 0.82f * p).coerceIn(0.12f, 1f),
+            alpha = (1f - 0.82f * p.coerceIn(0f, 1f)).coerceIn(0.12f, 1f),
         )
     }
 
@@ -1184,8 +1310,8 @@ object FreeformPolicy {
 
     /**
      * Single freeform corner radius for ALL four corners (top+bottom unified).
-     * Prefer the active SystemUI freeform radius. The physical display radius describes the panel,
-     * not an app window, and can differ substantially from the system freeform frame.
+     * Prefer the active SystemUI / window radius. Physical display bezels are only used when they
+     * look like window metrics; square-corner devices still get [MIN_FREEFORM_CORNER_DP].
      * [isMini] no longer forces a different radius — top/bottom stay identical in every state.
      */
     fun freeformCornerRadiusPx(
@@ -1193,6 +1319,9 @@ object FreeformPolicy {
         context: Context = SystemServices.systemContext,
     ): Float {
         val d = context.resources.displayMetrics.density
+        val minPx = MIN_FREEFORM_CORNER_DP * d
+        val maxWindowPx = MAX_WINDOW_CORNER_DP * d
+        fun floor(value: Float): Float = value.coerceAtLeast(minPx)
         // 1) SystemUI freeform radius (same value for task crop and overlay frame).
         val dimen = SystemServices.systemUiDimensionPx(
             listOf(
@@ -1202,11 +1331,8 @@ object FreeformPolicy {
                 "desktop_windowing_freeform_rounded_corner_radius",
             ),
         )
-        if (dimen != null && dimen > 0) return dimen.toFloat()
-        // 2) Device rounded corner when the ROM has no explicit freeform resource.
-        val sys = systemCornerRadiusPx(context)
-        if (sys > 0f) return sys
-        // 3) Framework dialog/config corner as a last system-like value.
+        if (dimen != null && dimen > 0) return floor(dimen.toFloat())
+        // 2) Framework dialog/config corner — the OS window language, not the panel bezel.
         val framework = runCatching {
             val res = context.resources
             for (name in listOf(
@@ -1222,12 +1348,16 @@ object FreeformPolicy {
             }
             0f
         }.getOrDefault(0f)
-        if (framework > 0f) return framework
+        if (framework > 0f) return floor(framework)
+        // 3) Device rounded corner only when it is in the window-radius range. Panel bezels are
+        // commonly 40–80dp and would turn a small window into a pill.
+        val sys = systemCornerRadiusPx(context)
+        if (sys in minPx..maxWindowPx) return sys
         // 4) Hard dp fallback (same for mini so top/bottom never diverge).
         // isMini kept in the signature for call-site compatibility.
         @Suppress("UNUSED_EXPRESSION")
         isMini
-        return FREEFORM_CORNER_DP * d
+        return floor(FREEFORM_CORNER_DP * d)
     }
 
     /**
@@ -1239,9 +1369,12 @@ object FreeformPolicy {
         visualWidth: Int,
         visualHeight: Int,
         context: Context = SystemServices.systemContext,
-    ): Float = freeformCornerRadiusPx(isMini, context).coerceAtMost(
-        minOf(visualWidth, visualHeight).coerceAtLeast(1) / 2f,
-    )
+    ): Float {
+        val raw = freeformCornerRadiusPx(isMini, context)
+        val half = minOf(visualWidth, visualHeight).coerceAtLeast(1) / 2f
+        val minPx = MIN_FREEFORM_CORNER_DP * context.resources.displayMetrics.density
+        return raw.coerceAtMost(half).coerceAtLeast(minPx.coerceAtMost(half))
+    }
 
     /** Radius submitted to a task leash whose local coordinates are transformed by [scale]. */
     fun freeformLeashCornerRadiusPx(
@@ -1588,20 +1721,17 @@ object FreeformPolicy {
         if (bounds.bottom <= topLimit) return null
 
         val result = Rect(bounds)
-        val targetTop = (topLimit - result.height()).coerceAtLeast(restriction.top)
-        result.offsetTo(result.left, targetTop)
-        // If still overlapping after max upward move, shrink height (Xiaomi setAvoidImeState lite).
-        if (result.bottom > topLimit) {
-            val minH = if (mini) dp(context, 120) else MIN_VISIBLE_AVOID_IME_FRAME_HEIGHT
-            val newBottom = topLimit.coerceAtLeast(result.top + minH)
-            result.bottom = newBottom.coerceAtMost(topLimit).coerceAtLeast(result.top + minH.coerceAtMost(topLimit - result.top))
-            if (result.bottom > topLimit && result.top > restriction.top) {
-                val shift = (result.bottom - topLimit).coerceAtMost(result.top - restriction.top)
-                result.offset(0, -shift)
-            }
-            if (result.bottom > topLimit) {
-                result.bottom = topLimit.coerceAtLeast(result.top + dp(context, 80))
-            }
+        val minH = if (mini) dp(context, 120) else MIN_VISIBLE_AVOID_IME_FRAME_HEIGHT
+        topLimit = topLimit.coerceIn(restriction.top, restriction.bottom)
+        val availableHeight = topLimit - restriction.top
+        // A bogus/full-display IME measurement must never collapse the task to zero/one pixel.
+        // Keeping the original window partially overlapped is safer than making it disappear.
+        if (availableHeight < minH) return null
+        if (result.height() <= availableHeight) {
+            result.offsetTo(result.left, topLimit - result.height())
+        } else {
+            result.top = restriction.top
+            result.bottom = topLimit
         }
         // Keep horizontally inside restriction.
         if (result.left < restriction.left) result.offset(restriction.left - result.left, 0)

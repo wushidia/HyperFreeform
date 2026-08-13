@@ -58,7 +58,10 @@ object HookSystem {
     @Volatile private var readyOnce = false
     @Volatile private var loggedSchedCfg = false
     @Volatile private var loggedInitialFreeformDpi = false
+    @Volatile private var loggedFreeformInsetsSuppression = false
     @Volatile private var lastLoggedDeliveredDpi = Int.MIN_VALUE
+    private val restoredRuntimeConfigLoggedTasks =
+        java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
     /** DPI attached to the synchronous ActivityStarter call that creates a module freeform Task. */
     private val launchingFreeformDpi = ThreadLocal<Int>()
 
@@ -72,6 +75,8 @@ object HookSystem {
             hookManagedTaskMinimumSize(ams.javaClass.classLoader)
             hookTaskEvents(ams)
             hookNormalLaunchOfTrackedFreeform(ams.javaClass.classLoader)
+            hookFreeformSystemUiFlags(ams.javaClass.classLoader)
+            hookFreeformInsetsControl(ams.javaClass.classLoader)
             hookImeVisibility(ams.javaClass.classLoader)
             hookFreeformMultiWindowAndOrientation(ams.javaClass.classLoader)
         } catch (t: Throwable) {
@@ -224,7 +229,12 @@ object HookSystem {
         }.getOrNull() ?: return
         val stableOverride = Configuration(override)
         val dpi = FreeformManagerService.freeformDpiOf(taskId)
-        injectConfiguredDpi(stableOverride, dpi)
+        canonicalizeManagedFreeformConfig(
+            stableOverride,
+            taskId,
+            FreeformManagerService.freeformBoundsOf(taskId),
+            appFullscreen = false,
+        )
         runCatching {
             XposedHelpers.callMethod(
                 record,
@@ -257,18 +267,26 @@ object HookSystem {
     }
 
     /**
-     * A launcher/icon start with no FREEFORM ActivityOptions normally reuses an existing same-app
-     * freeform task. Promote that task to fullscreen before ActivityStarter performs task reuse.
-     * Starts made by the app from inside its own freeform task are left untouched.
+     * Ordinary (non-freeform-options) starts must not inherit the always-on-top freeform root.
+     * Otherwise a home/recents/icon launch becomes another freeform window and fights z-order,
+     * which shows up as a flickering floating app. In-app navigation inside a managed freeform
+     * is left untouched. Starts made by the module request WINDOWING_MODE_FREEFORM explicitly.
      */
     private fun hookNormalLaunchOfTrackedFreeform(cl: ClassLoader?) {
         runCatching {
             val starter = XposedHelpers.findClass("com.android.server.wm.ActivityStarter", cl)
             val activityRecord = XposedHelpers.findClass("com.android.server.wm.ActivityRecord", cl)
             var hooked = 0
-            for (method in starter.declaredMethods) {
-                if (method.name != "startActivityUnchecked") continue
-                if (method.parameterTypes.firstOrNull() != activityRecord) continue
+            val preferredMethods = starter.declaredMethods.filter {
+                it.name == "startActivityUnchecked" &&
+                    it.parameterTypes.firstOrNull() == activityRecord
+            }.ifEmpty {
+                starter.declaredMethods.filter {
+                    it.name == "startActivityInner" &&
+                        it.parameterTypes.firstOrNull() == activityRecord
+                }
+            }
+            for (method in preferredMethods) {
                 val optionsIndex = method.parameterTypes.indexOfFirst {
                     it.name == "android.app.ActivityOptions"
                 }
@@ -304,36 +322,24 @@ object HookSystem {
                         }
                         val packageName = activityRecordPackage(start) ?: return
                         val sourceTaskId = activityRecordTaskId(source)
-                        if (isHomeLaunch(start, source) &&
+                        // Any Activity launched from a managed small-window task must preserve that
+                        // task's mode. This includes cross-package system helpers (permissions,
+                        // document pickers, credentials, etc.); forcing one of them fullscreen
+                        // changes the whole source task and produces a visible window jump.
+                        // Launcher/recents starts do not originate from the managed task, so they
+                        // still take the explicit fullscreen path below.
+                        val fromManagedFreeform = sourceTaskId != null &&
+                            FreeformManagerService.isVisibleFreeformTask(sourceTaskId)
+                        if (!fromManagedFreeform &&
                             FreeformManagerService.hasVisibleFreeformTask()
                         ) {
-                            // The always-on-top freeform root can remain the focused root while
-                            // HOME is visible behind it. Explicitly select fullscreen for ordinary
-                            // icon starts so ActivityStarter never inherits that freeform root.
-                            if (optionsIndex >= 0) {
-                                val fullscreenOptions = options as? ActivityOptions
-                                    ?: ActivityOptions.makeBasic().also {
-                                        param.args[optionsIndex] = it
-                                    }
-                                runCatching {
-                                    XposedHelpers.callMethod(
-                                        fullscreenOptions,
-                                        "setLaunchWindowingMode",
-                                        FreeformPolicy.WINDOWING_MODE_FULLSCREEN,
-                                    )
-                                }.onFailure {
-                                    XLog.e("launcher fullscreen option failed pkg=$packageName", it)
-                                }
-                                XLog.i(
-                                    "launcher normal launch forced fullscreen pkg=$packageName " +
-                                        "sourceTask=${sourceTaskId ?: -1}",
-                                )
-                            } else {
-                                XLog.e(
-                                    "launcher normal launch has no ActivityOptions slot " +
-                                        "pkg=$packageName",
-                                )
-                            }
+                            forceOrdinaryLaunchFullscreen(
+                                param,
+                                options,
+                                optionsIndex,
+                                packageName,
+                                sourceTaskId,
+                            )
                         }
                         FreeformManagerService.promoteTrackedFreeformForNormalLaunch(
                             packageName,
@@ -343,13 +349,248 @@ object HookSystem {
 
                     override fun afterHookedMethod(param: MethodHookParam) {
                         launchingFreeformDpi.remove()
+                        val sourceTaskId = activityRecordTaskId(param.args.getOrNull(1))
+                        if (sourceTaskId != null &&
+                            FreeformManagerService.isVisibleFreeformTask(sourceTaskId)
+                        ) {
+                            return
+                        }
+                        val start = param.args.getOrNull(0) ?: return
+                        val packageName = activityRecordPackage(start) ?: return
+                        if (FreeformManagerService.isPendingFreeformLaunch(packageName)) return
+                        if (!FreeformManagerService.hasVisibleFreeformTask()) return
+                        val taskId = activityRecordTaskId(start) ?: return
+                        if (FreeformManagerService.isVisibleFreeformTask(taskId)) return
+                        val mode = activityRecordWindowingMode(start) ?: return
+                        if (mode != FreeformPolicy.WINDOWING_MODE_FREEFORM) return
+                        FreeformManagerService.revertUnsolicitedFreeformLaunch(taskId, packageName)
                     }
                 })
                 hooked++
             }
-            check(hooked > 0) { "no ActivityStarter.startActivityUnchecked overload" }
+            check(hooked > 0) { "no compatible ActivityStarter start method" }
             XLog.i("Hooked ActivityStarter normal-launch freeform promotion x$hooked")
         }.onFailure { XLog.e("normal-launch freeform promotion hook failed", it) }
+    }
+
+    private fun forceOrdinaryLaunchFullscreen(
+        param: XC_MethodHook.MethodHookParam,
+        options: Any?,
+        optionsIndex: Int,
+        packageName: String,
+        sourceTaskId: Int?,
+    ) {
+        if (optionsIndex < 0) {
+            XLog.e("ordinary launch has no ActivityOptions slot pkg=$packageName")
+            return
+        }
+        val fullscreenOptions = options as? ActivityOptions
+            ?: ActivityOptions.makeBasic().also { param.args[optionsIndex] = it }
+        runCatching {
+            XposedHelpers.callMethod(
+                fullscreenOptions,
+                "setLaunchWindowingMode",
+                FreeformPolicy.WINDOWING_MODE_FULLSCREEN,
+            )
+        }.onFailure {
+            XLog.e("ordinary launch fullscreen option failed pkg=$packageName", it)
+        }
+        runCatching {
+            XposedHelpers.callMethod(fullscreenOptions, "setLaunchBounds", null as android.graphics.Rect?)
+        }
+        XLog.i(
+            "ordinary launch forced fullscreen pkg=$packageName sourceTask=${sourceTaskId ?: -1}",
+        )
+    }
+
+    /**
+     * A focused freeform task would otherwise become the insets/system-bar control target and
+     * pull a fullscreen app out of immersive mode (white status/navigation bars).
+     */
+    private fun hookFreeformSystemUiFlags(cl: ClassLoader?) {
+        val hooker = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                if (param.result != true) return
+                val taskId = systemUiTaskId(param.thisObject) ?: return
+                if (FreeformManagerService.shouldIgnoreSystemUiFlags(taskId)) {
+                    param.result = false
+                }
+            }
+        }
+        for (className in listOf(
+            "com.android.server.wm.Task",
+            "com.android.server.wm.WindowState",
+            "com.android.server.wm.ActivityRecord",
+        )) {
+            runCatching {
+                val clazz = XposedHelpers.findClass(className, cl)
+                val hooks = XposedBridge.hookAllMethods(clazz, "canAffectSystemUiFlags", hooker)
+                if (hooks.isNotEmpty()) {
+                    XLog.i("Hooked $className.canAffectSystemUiFlags x${hooks.size}")
+                }
+            }.onFailure {
+                XLog.d("$className.canAffectSystemUiFlags unavailable: ${it.message}")
+            }
+        }
+    }
+
+    /**
+     * API35+ system bars follow the focused window's requestedVisibleTypes through InsetsPolicy,
+     * not the legacy canAffectSystemUiFlags path. When a freeform small window takes focus over a
+     * fullscreen immersive app it would otherwise become the status/navigation bar control target
+     * and force the bars visible, breaking the underlying app's fullscreen. Redirect bar control
+     * back to the top fullscreen-opaque window so that window keeps deciding bar visibility.
+     */
+    private fun hookFreeformInsetsControl(cl: ClassLoader?) {
+        val insetsPolicy = runCatching {
+            XposedHelpers.findClass("com.android.server.wm.InsetsPolicy", cl)
+        }.getOrNull() ?: run {
+            XLog.e("InsetsPolicy class not found")
+            return
+        }
+        // Stop a freeform focus change from writing status/navigation bars into
+        // mForciblyShowingTypes. Once that bit is stored, Android returns its permanent showing
+        // target before reaching the built-in multi-window fallback to the fullscreen app.
+        runCatching {
+            val hooks = XposedBridge.hookAllMethods(
+                insetsPolicy,
+                "updateSystemBars",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        // DisplayPolicy deliberately passes the underlying fullscreen window here
+                        // when the real focus is freeform, so inspect its mFocusedWindow instead of
+                        // trusting arg0. The tracked-task fallback covers first-layout timing gaps.
+                        val displayFocus = displayPolicyFocusedWindow(param.thisObject)
+                        val managedFreeformFocused =
+                            displayFocus?.let(::windowModeOf) ==
+                                FreeformPolicy.WINDOWING_MODE_FREEFORM ||
+                                FreeformManagerService.hasVisibleFreeformTask()
+                        if (!managedFreeformFocused) {
+                            return
+                        }
+                        val topFs = topFullscreenOpaqueWindow(param.thisObject) ?: return
+                        val forcedShowing = param.args.getOrNull(1) as? Int ?: return
+                        val systemBars = android.view.WindowInsets.Type.statusBars() or
+                            android.view.WindowInsets.Type.navigationBars()
+                        param.args[1] = forcedShowing and systemBars.inv()
+                        // When no explicit force-show/hide type remains, this boolean would make
+                        // updateSystemBars add both bars back. The normal control-target path still
+                        // shows bars for a non-immersive underlying app and for a visible IME.
+                        if (param.args.getOrNull(3) is Boolean) param.args[3] = false
+                        if (!loggedFreeformInsetsSuppression) {
+                            loggedFreeformInsetsSuppression = true
+                            XLog.d(
+                                "insets: suppress forced bars for freeform focus " +
+                                    "old=$forcedShowing new=${param.args[1]}",
+                            )
+                        }
+                    }
+                },
+            )
+            if (hooks.isNotEmpty()) {
+                XLog.i("Hooked InsetsPolicy.updateSystemBars x${hooks.size}")
+            }
+        }.onFailure {
+            XLog.e("InsetsPolicy.updateSystemBars hook failed", it)
+        }
+        // Android 16 checks "forcibly shown" before its normal multi-window fallback to the
+        // underlying fullscreen app. Limit the override to that permanent-target result; this
+        // preserves user-requested transient bars and the navigation bar required by a visible IME.
+        val redirect = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val focusedWin = param.args.getOrNull(0) ?: return
+                if (windowModeOf(focusedWin) != FreeformPolicy.WINDOWING_MODE_FREEFORM) return
+                val permanentTarget = runCatching {
+                    XposedHelpers.getObjectField(
+                        param.thisObject,
+                        "mShowingPermanentControlTarget",
+                    )
+                }.getOrNull() ?: return
+                if (param.result !== permanentTarget) return
+                if (param.method.name == "getNavControlTargetInner" &&
+                    isInsetsImeVisible(param.thisObject)
+                ) {
+                    return
+                }
+                val topFs = topFullscreenOpaqueWindow(param.thisObject) ?: return
+                if (topFs === focusedWin) return
+                param.result = topFs
+                XLog.d("insets: redirect ${param.method.name} freeform->topFullscreen")
+            }
+        }
+        var hooked = 0
+        for (name in listOf("getStatusControlTargetInner", "getNavControlTargetInner")) {
+            runCatching {
+                val hooks = XposedBridge.hookAllMethods(insetsPolicy, name, redirect)
+                if (hooks.isNotEmpty()) {
+                    hooked += hooks.size
+                    XLog.i("Hooked InsetsPolicy.$name x${hooks.size}")
+                }
+            }.onFailure {
+                XLog.d("InsetsPolicy.$name hook unavailable: ${it.message}")
+            }
+        }
+        if (hooked == 0) XLog.e("InsetsPolicy bar-control hooks not applied")
+    }
+
+    private fun windowModeOf(win: Any): Int? = runCatching {
+        XposedHelpers.callMethod(win, "getWindowingMode") as? Int
+    }.getOrNull() ?: runCatching {
+        val task = XposedHelpers.callMethod(win, "getTask")
+        XposedHelpers.callMethod(task, "getWindowingMode") as? Int
+    }.getOrNull()
+
+    private fun topFullscreenOpaqueWindow(insetsPolicy: Any): Any? {
+        val policy = runCatching {
+            XposedHelpers.getObjectField(insetsPolicy, "mPolicy")
+        }.getOrNull() ?: return null
+        return runCatching {
+            XposedHelpers.callMethod(policy, "getTopFullscreenOpaqueWindow")
+        }.getOrNull()
+    }
+
+    private fun displayPolicyFocusedWindow(insetsPolicy: Any): Any? {
+        val policy = runCatching {
+            XposedHelpers.getObjectField(insetsPolicy, "mPolicy")
+        }.getOrNull() ?: return null
+        return runCatching {
+            XposedHelpers.getObjectField(policy, "mFocusedWindow")
+        }.getOrNull()
+    }
+
+    private fun isInsetsImeVisible(insetsPolicy: Any): Boolean {
+        val displayContent = runCatching {
+            XposedHelpers.getObjectField(insetsPolicy, "mDisplayContent")
+        }.getOrNull() ?: return false
+        val imeWindow = runCatching {
+            XposedHelpers.getObjectField(displayContent, "mInputMethodWindow")
+        }.getOrNull() ?: return false
+        return runCatching {
+            XposedHelpers.callMethod(imeWindow, "isVisible") as? Boolean
+        }.getOrNull() == true
+    }
+
+    private fun systemUiTaskId(obj: Any): Int? {
+        val direct = taskIdOrNull(obj)
+        if (direct != null && direct > 0) return direct
+        val task = runCatching { XposedHelpers.callMethod(obj, "getTask") }.getOrNull()
+            ?: runCatching { XposedHelpers.callMethod(obj, "getRootTask") }.getOrNull()
+            ?: return null
+        return taskIdOrNull(task)
+    }
+
+    private fun taskIdOrNull(obj: Any): Int? {
+        val id = taskId(obj)
+        return id.takeIf { it > 0 }
+    }
+
+    private fun activityRecordWindowingMode(record: Any): Int? {
+        return runCatching {
+            XposedHelpers.callMethod(record, "getWindowingMode") as? Int
+        }.getOrNull() ?: runCatching {
+            val task = XposedHelpers.callMethod(record, "getTask") ?: return@runCatching null
+            XposedHelpers.callMethod(task, "getWindowingMode") as? Int
+        }.getOrNull()
     }
 
     private fun activityRecordPackage(record: Any): String? {
@@ -368,38 +609,6 @@ object HookSystem {
             runCatching { XposedHelpers.getIntField(task, "mTaskId") }.getOrNull()
                 ?: (XposedHelpers.callMethod(task, "getTaskId") as? Int)
         }.getOrNull()
-    }
-
-    private fun activityRecordActivityType(record: Any?): Int? {
-        if (record == null) return null
-        return runCatching {
-            XposedHelpers.callMethod(record, "getActivityType") as? Int
-        }.getOrNull() ?: runCatching {
-            val task = XposedHelpers.callMethod(record, "getTask") ?: return@runCatching null
-            XposedHelpers.callMethod(task, "getActivityType") as? Int
-        }.getOrNull()
-    }
-
-    private fun activityRecordLaunchedFromPackage(record: Any): String? =
-        runCatching {
-            XposedHelpers.getObjectField(record, "launchedFromPackage") as? String
-        }.getOrNull() ?: runCatching {
-            XposedHelpers.getObjectField(record, "mLaunchedFromPackage") as? String
-        }.getOrNull()
-
-    /** True only for an ordinary icon launch whose source is the current HOME activity. */
-    private fun isHomeLaunch(start: Any, source: Any?): Boolean {
-        // WindowConfiguration.ACTIVITY_TYPE_HOME = 2.
-        if (activityRecordActivityType(source) == 2) return true
-        val sourcePackage = source?.let(::activityRecordPackage)
-        val launchedFrom = activityRecordLaunchedFromPackage(start)
-        val homePackage = runCatching {
-            val homeIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
-            SystemServices.packageManager.resolveActivity(homeIntent, 0)
-                ?.activityInfo?.packageName
-        }.getOrNull()
-        return !homePackage.isNullOrBlank() &&
-            (sourcePackage == homePackage || launchedFrom == homePackage)
     }
 
     /**
@@ -452,7 +661,7 @@ object HookSystem {
                         clazz,
                         "setRequestedOrientation",
                         object : XC_MethodHook() {
-                            override fun afterHookedMethod(param: MethodHookParam) {
+                            override fun beforeHookedMethod(param: MethodHookParam) {
                                 val token = param.args.getOrNull(0)
                                 val orientation = param.args.getOrNull(1) as? Int ?: return
                                 val taskId = taskIdFromActivityToken(token) ?: return
@@ -479,7 +688,7 @@ object HookSystem {
                 arClz,
                 "setRequestedOrientation",
                 object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
                         val orientation = param.args.firstOrNull { it is Int } as? Int ?: return
                         val taskId = runCatching {
                             val task = XposedHelpers.callMethod(param.thisObject, "getTask") ?: return
@@ -531,57 +740,18 @@ object HookSystem {
                         // Tracked bounds (may be null on the FIRST resolution during launch, before
                         // FreeformManagerService has registered the task).
                         val ffBounds = FreeformManagerService.freeformBoundsOf(taskId)
-                        if (ffBounds != null) {
-                            // Keep windowingMode=freeform here so WM's occlusion/visibility is
-                            // unchanged (home/wallpaper stay drawn → no black background). Only make
-                            // maxBounds==bounds for apps that compare current/maximum window metrics
-                            // instead of windowingMode.
-                            runCatching { XposedHelpers.callMethod(winCfg, "setMaxBounds", ffBounds) }
-                        }
-                        // Force Configuration.orientation to match the actual window aspect. WM only
-                        // AUTO-derives orientation when it is ORIENTATION_UNDEFINED; once set, a later
-                        // freeform resize to a landscape rect updates screenWidthDp/heightDp but leaves
-                        // orientation=PORTRAIT — so a landscape-video app (e.g. bilibili) stays in its
-                        // PORTRAIT player UI (recommendations/comments truncated) instead of switching
-                        // to the true landscape fullscreen player. Re-derive it from the bounds.
-                        runCatching {
-                            val ob = ffBounds
-                                ?: (XposedHelpers.callMethod(winCfg, "getBounds") as? android.graphics.Rect)
-                            if (ob != null && ob.width() > 0 && ob.height() > 0) {
-                                // ORIENTATION_LANDSCAPE = 2, ORIENTATION_PORTRAIT = 1.
-                                resolved.javaClass.getField("orientation")
-                                    .setInt(resolved, if (ob.width() > ob.height()) 2 else 1)
-                            }
-                        }
-                        // In-window DPI zoom (Xiaomi small-window DPI). Apply on EVERY freeform
-                        // resolution — including the first, launch-time one before the task is
-                        // tracked — so a fresh window opens at the user's DPI with NO relaunch. Use
-                        // tracked bounds if present, else the config's own freeform bounds for the
-                        // dp recompute. freeformDpiOf() falls back to the global setting for untracked
-                        // tasks, so the user's global DPI is honoured from the very first frame.
-                        val dpi = FreeformManagerService.freeformDpiOf(taskId)
-                        if (dpi > 0) {
-                            runCatching {
-                                val bounds = ffBounds
-                                    ?: (XposedHelpers.callMethod(winCfg, "getBounds") as? android.graphics.Rect)
-                                if (bounds != null && bounds.width() > 0 && bounds.height() > 0) {
-                                    resolved.javaClass.getField("densityDpi").setInt(resolved, dpi)
-                                    val density = dpi / 160f
-                                    val wDp = (bounds.width() / density).toInt()
-                                    val hDp = (bounds.height() / density).toInt()
-                                    resolved.javaClass.getField("screenWidthDp").setInt(resolved, wDp)
-                                    resolved.javaClass.getField("screenHeightDp").setInt(resolved, hDp)
-                                    resolved.javaClass.getField("smallestScreenWidthDp")
-                                        .setInt(resolved, minOf(wDp, hDp))
-                                    if (ffBounds == null && !loggedInitialFreeformDpi) {
-                                        loggedInitialFreeformDpi = true
-                                        XLog.i(
-                                            "Initial freeform config has custom DPI " +
-                                                "task=$taskId dpi=$dpi bounds=$bounds"
-                                        )
-                                    }
-                                }
-                            }
+                        canonicalizeManagedFreeformConfig(
+                            resolved,
+                            taskId,
+                            ffBounds,
+                            appFullscreen = false,
+                        )
+                        if (ffBounds == null && !loggedInitialFreeformDpi) {
+                            loggedInitialFreeformDpi = true
+                            XLog.i(
+                                "Initial freeform config has custom DPI " +
+                                    "task=$taskId dpi=${FreeformManagerService.freeformDpiOf(taskId)}",
+                            )
                         }
                     }
 
@@ -596,7 +766,8 @@ object HookSystem {
         // ActivityRecord compares its next resolved configuration against mLastReportedConfiguration
         // to decide whether an Activity must relaunch. Keep the *override* half of that snapshot at
         // the same custom density as getConfiguration(). The previous delivery-only rewrite made
-        // the client render at 504dpi but left WM's snapshot override at 630dpi; opening any child
+        // the client render at the selected density but left WM's snapshot override at display
+        // density; opening any child
         // Activity then produced CONFIG_DENSITY | CONFIG_SCREEN_SIZE and relaunched the whole task.
         runCatching {
             val arClz = XposedHelpers.findClass("com.android.server.wm.ActivityRecord", cl)
@@ -621,7 +792,13 @@ object HookSystem {
                         if (!managed || taskMode != FreeformPolicy.WINDOWING_MODE_FREEFORM) return
                         val clone = Configuration(override)
                         val dpi = FreeformManagerService.freeformDpiOf(taskId)
-                        if (!injectConfiguredDpi(clone, dpi)) return
+                        if (!canonicalizeManagedFreeformConfig(
+                                clone,
+                                taskId,
+                                FreeformManagerService.freeformBoundsOf(taskId),
+                                appFullscreen = false,
+                            )
+                        ) return
                         param.args[1] = clone
                         if (loggedTasks.add(taskId)) {
                             XLog.i(
@@ -676,31 +853,45 @@ object HookSystem {
             }.getOrNull()
             val clmClz = XposedHelpers.findClass("com.android.server.wm.ClientLifecycleManager", cl)
 
-            fun handleArg(arg: Any?, transactionDpi: Int? = null) {
+            fun handleArg(
+                arg: Any?,
+                transactionDpi: Int? = null,
+                transactionTaskId: Int? = null,
+            ) {
                 if (arg == null) return
                 // Varargs overloads (scheduleTransactionItems) pass a ClientTransactionItem[].
                 if (arg.javaClass.isArray) {
                     val len = java.lang.reflect.Array.getLength(arg)
                     for (i in 0 until len) {
-                        handleArg(java.lang.reflect.Array.get(arg, i), transactionDpi)
+                        handleArg(
+                            java.lang.reflect.Array.get(arg, i),
+                            transactionDpi,
+                            transactionTaskId,
+                        )
                     }
                     return
                 }
                 when {
-                    itemBaseClz != null && itemBaseClz.isInstance(arg) ->
-                        fixItemConfigs(cfgClz, mergedClz, arg, transactionDpi)
+                    itemBaseClz != null && itemBaseClz.isInstance(arg) -> {
+                        val taskId = taskIdForTransaction(arg) ?: transactionTaskId
+                        val dpi = taskId?.let(FreeformManagerService::freeformDpiOf)
+                            ?: transactionDpi
+                        fixItemConfigs(cfgClz, mergedClz, arg, dpi, taskId)
+                    }
                     txClz != null && txClz.isInstance(arg) -> {
-                        val dpi = dpiForTransaction(arg) ?: transactionDpi
+                        val taskId = taskIdForTransaction(arg) ?: transactionTaskId
+                        val dpi = taskId?.let(FreeformManagerService::freeformDpiOf)
+                            ?: transactionDpi
                         // ClientTransaction bundles items (launch path).
                         runCatching {
                             val items = XposedHelpers.callMethod(arg, "getTransactionItems") as? List<*>
                                 ?: (XposedHelpers.getObjectField(arg, "mActivityCallbacks") as? List<*>)
-                            items?.forEach { fixItemConfigs(cfgClz, mergedClz, it, dpi) }
+                            items?.forEach { fixItemConfigs(cfgClz, mergedClz, it, dpi, taskId) }
                         }
                         // Older single-item ClientTransaction also has mLifecycleStateRequest.
                         runCatching {
                             XposedHelpers.getObjectField(arg, "mLifecycleStateRequest")
-                                ?.let { fixItemConfigs(cfgClz, mergedClz, it, dpi) }
+                                ?.let { fixItemConfigs(cfgClz, mergedClz, it, dpi, taskId) }
                         }
                     }
                 }
@@ -739,9 +930,14 @@ object HookSystem {
                     val lastReported = runCatching {
                         XposedHelpers.getObjectField(param.thisObject, "mLastReportedConfiguration")
                     }.getOrNull()
+                    val taskId = taskIdForWindowState(param.thisObject)
                     for (a in param.args) {
                         if (a != null && mergedClz.isInstance(a) && a !== lastReported) {
-                            fixMergedInPlace(a, dpiForWindowState(param.thisObject))
+                            fixMergedInPlace(
+                                a,
+                                taskDpi = taskId?.let(FreeformManagerService::freeformDpiOf),
+                                taskId = taskId,
+                            )
                         }
                     }
                 }
@@ -781,11 +977,17 @@ object HookSystem {
                                 val ws = param.thisObject ?: return
                                 val merged = param.result ?: return
                                 if (!mergedClz.isInstance(merged)) return
-                                if (!isWindowStateFreeform(ws)) return
+                                val taskId = taskIdForWindowState(ws) ?: return
+                                if (!FreeformManagerService.isVisibleFreeformTask(taskId)) return
                                 // Hand back a clone with windowingMode=fullscreen on BOTH inner
                                 // configs; never touch the shared WM record.
                                 val clone = ctor.newInstance(merged)
-                                if (fixMergedInPlace(clone, dpiForWindowState(ws))) {
+                                if (fixMergedInPlace(
+                                        clone,
+                                        taskDpi = FreeformManagerService.freeformDpiOf(taskId),
+                                        taskId = taskId,
+                                    )
+                                ) {
                                     param.result = clone
                                 }
                             }
@@ -804,16 +1006,18 @@ object HookSystem {
                             val ws = param.thisObject ?: return
                             val cfg = param.result ?: return
                             if (!cfgClz.isInstance(cfg)) return
-                            if (!isWindowStateFreeform(ws)) return
-                            val wc = XposedHelpers.getObjectField(cfg, "windowConfiguration") ?: return
-                            val mode = XposedHelpers.callMethod(wc, "getWindowingMode") as? Int
-                            if (mode != FreeformPolicy.WINDOWING_MODE_FREEFORM) return
+                            val taskId = taskIdForWindowState(ws) ?: return
+                            if (!FreeformManagerService.isVisibleFreeformTask(taskId)) return
                             val clone = cfgClz.getConstructor(cfgClz).newInstance(cfg)
-                            val fresh = wc.javaClass.getConstructor(wc.javaClass).newInstance(wc)
-                            XposedHelpers.callMethod(fresh, "setWindowingMode", 1)
-                            XposedHelpers.setObjectField(clone, "windowConfiguration", fresh)
-                            injectConfiguredDpi(clone, dpiForWindowState(ws))
-                            param.result = clone
+                            if (canonicalizeManagedFreeformConfig(
+                                    clone,
+                                    taskId,
+                                    FreeformManagerService.freeformBoundsOf(taskId),
+                                    appFullscreen = true,
+                                )
+                            ) {
+                                param.result = clone
+                            }
                         }
                     })
                 }
@@ -849,24 +1053,13 @@ object HookSystem {
         }.getOrNull()
     }
 
-    private fun isWindowStateFreeform(ws: Any): Boolean {
-        val taskId = taskIdForWindowState(ws) ?: return false
-        return FreeformManagerService.isVisibleFreeformTask(taskId)
-    }
-
-    private fun dpiForWindowState(ws: Any): Int? = taskIdForWindowState(ws)
-        ?.let(FreeformManagerService::freeformDpiOf)
-        ?.takeIf { it > 0 }
-
-    private fun dpiForTransaction(transaction: Any): Int? {
+    private fun taskIdForTransaction(transaction: Any): Int? {
         val token = runCatching {
             XposedHelpers.callMethod(transaction, "getActivityToken")
         }.getOrNull() ?: runCatching {
             XposedHelpers.getObjectField(transaction, "mActivityToken")
         }.getOrNull()
         return taskIdFromActivityToken(token)
-            ?.let(FreeformManagerService::freeformDpiOf)
-            ?.takeIf { it > 0 }
     }
 
     /** Scan a ClientTransactionItem for Configuration / MergedConfiguration fields and flip freeform→fullscreen. */
@@ -875,6 +1068,7 @@ object HookSystem {
         mergedClz: Class<*>?,
         item: Any?,
         dpi: Int? = null,
+        taskId: Int? = null,
     ) {
         if (item == null) return
         var c: Class<*>? = item.javaClass
@@ -883,7 +1077,7 @@ object HookSystem {
                 runCatching {
                     val t = f.type
                     if (t == cfgClz || cfgClz.isAssignableFrom(t)) {
-                        reportFullscreenForFreeformConfig(cfgClz, item, f.name, dpi)
+                        reportFullscreenForFreeformConfig(cfgClz, item, f.name, dpi, taskId)
                     } else if (mergedClz != null && (t == mergedClz || mergedClz.isAssignableFrom(t))) {
                         f.isAccessible = true
                         val merged = f.get(item)
@@ -894,7 +1088,14 @@ object HookSystem {
                             val clone = runCatching {
                                 mergedClz.getConstructor(mergedClz).newInstance(merged)
                             }.getOrNull()
-                            if (clone != null && fixMergedInPlace(clone, dpi)) f.set(item, clone)
+                            if (clone != null && fixMergedInPlace(
+                                    clone,
+                                    taskDpi = dpi,
+                                    taskId = taskId,
+                                )
+                            ) {
+                                f.set(item, clone)
+                            }
                         }
                     }
                 }
@@ -911,15 +1112,49 @@ object HookSystem {
      * the app applies (getMergedConfiguration); mOverrideConfig guards any re-merge. Returns true if
      * anything was freeform.
      */
-    private fun fixMergedInPlace(merged: Any, taskDpi: Int? = null): Boolean {
+    private fun fixMergedInPlace(
+        merged: Any,
+        taskDpi: Int? = null,
+        taskId: Int? = null,
+    ): Boolean {
         var changed = false
-        val dpi = taskDpi ?: FreeformPolicy.freeformDpiFromSettings().takeIf { it > 0 }
+        val runtimeTaskIsFreeform = taskId != null &&
+            SystemServices.taskWindowingMode(taskId) == FreeformPolicy.WINDOWING_MODE_FREEFORM
+        val managedFreeform = taskId != null && runtimeTaskIsFreeform &&
+            FreeformManagerService.isVisibleFreeformTask(taskId)
+        val dpi = if (taskId == null || managedFreeform) {
+            taskDpi ?: FreeformPolicy.freeformDpiFromSettings().takeIf { it > 0 }
+        } else {
+            null
+        }
         for (mf in listOf("mMergedConfig", "mOverrideConfig")) {
             runCatching {
                 val cfg = XposedHelpers.getObjectField(merged, mf) ?: return@runCatching
                 val wc = XposedHelpers.getObjectField(cfg, "windowConfiguration") ?: return@runCatching
                 val mode = XposedHelpers.callMethod(wc, "getWindowingMode") as? Int
-                if (mode == FreeformPolicy.WINDOWING_MODE_FREEFORM) {
+                if (taskId != null && mode != null && mode in intArrayOf(
+                        FreeformPolicy.WINDOWING_MODE_FREEFORM,
+                        FreeformPolicy.WINDOWING_MODE_FULLSCREEN,
+                    )
+                ) {
+                    // A maximize removes the task from FreeformManagerService immediately after
+                    // switching WM to fullscreen. The queued client transaction can arrive a few
+                    // frames later; do not use freeformDpiOf(taskId) for that stale fullscreen
+                    // transaction. Only tracked freeform tasks get the custom-DPI path.
+                    if (!managedFreeform) {
+                        if (runtimeTaskIsFreeform.not()) {
+                            replaceWithRuntimeTaskConfiguration(cfg, taskId)
+                            changed = true
+                        }
+                        return@runCatching
+                    }
+                    changed = canonicalizeManagedFreeformConfig(
+                        cfg,
+                        taskId,
+                        FreeformManagerService.freeformBoundsOf(taskId),
+                        appFullscreen = true,
+                    ) || changed
+                } else if (taskId == null && mode == FreeformPolicy.WINDOWING_MODE_FREEFORM) {
                     injectConfiguredDpi(cfg, dpi)
                     XposedHelpers.callMethod(wc, "setWindowingMode", 1)
                     changed = true
@@ -945,22 +1180,46 @@ object HookSystem {
         holder: Any,
         field: String,
         taskDpi: Int? = null,
+        taskId: Int? = null,
     ) {
         runCatching {
             val cfg = XposedHelpers.getObjectField(holder, field) ?: return
             if (!cfgClz.isInstance(cfg)) return
             val winCfg = XposedHelpers.getObjectField(cfg, "windowConfiguration") ?: return
             val mode = XposedHelpers.callMethod(winCfg, "getWindowingMode") as? Int
+            if (taskId != null && SystemServices.taskWindowingMode(taskId) !=
+                FreeformPolicy.WINDOWING_MODE_FREEFORM
+            ) {
+                // The item can have been built before maximize and queued after the task is
+                // already fullscreen. Replace that stale snapshot with the runtime task config;
+                // this restores the display density without any package/device special case.
+                val clone = cfgClz.getConstructor(cfgClz).newInstance(cfg)
+                if (replaceWithRuntimeTaskConfiguration(clone, taskId)) {
+                    XposedHelpers.setObjectField(holder, field, clone)
+                }
+                return
+            }
             if (mode != FreeformPolicy.WINDOWING_MODE_FREEFORM) return
+            if (taskId != null && !FreeformManagerService.isVisibleFreeformTask(taskId)) return
             val clone = cfgClz.getConstructor(cfgClz).newInstance(cfg)
-            val wcClz = winCfg.javaClass
-            val freshWin = wcClz.getConstructor(wcClz).newInstance(winCfg)
-            XposedHelpers.callMethod(freshWin, "setWindowingMode", 1)
-            XposedHelpers.setObjectField(clone, "windowConfiguration", freshWin)
-            injectConfiguredDpi(
-                clone,
-                taskDpi ?: FreeformPolicy.freeformDpiFromSettings().takeIf { it > 0 },
-            )
+            if (taskId != null) {
+                if (!canonicalizeManagedFreeformConfig(
+                        clone,
+                        taskId,
+                        FreeformManagerService.freeformBoundsOf(taskId),
+                        appFullscreen = true,
+                    )
+                ) return
+            } else {
+                val wcClz = winCfg.javaClass
+                val freshWin = wcClz.getConstructor(wcClz).newInstance(winCfg)
+                XposedHelpers.callMethod(freshWin, "setWindowingMode", 1)
+                XposedHelpers.setObjectField(clone, "windowConfiguration", freshWin)
+                injectConfiguredDpi(
+                    clone,
+                    taskDpi ?: FreeformPolicy.freeformDpiFromSettings().takeIf { it > 0 },
+                )
+            }
             XposedHelpers.setObjectField(holder, field, clone)
             if (!loggedSchedCfg) {
                 loggedSchedCfg = true
@@ -968,6 +1227,85 @@ object HookSystem {
             }
         }
     }
+
+    /** Copy the task's current resolved configuration into a queued independent config object. */
+    private fun replaceWithRuntimeTaskConfiguration(config: Any, taskId: Int): Boolean {
+        val runtime = SystemServices.taskConfiguration(taskId) ?: return false
+        return runCatching {
+            val setTo = config.javaClass.methods.firstOrNull {
+                it.name == "setTo" && it.parameterTypes.size == 1 &&
+                    it.parameterTypes[0].isAssignableFrom(runtime.javaClass)
+            } ?: return@runCatching false
+            setTo.invoke(config, runtime)
+            if (restoredRuntimeConfigLoggedTasks.add(taskId)) {
+                val density = runtime.javaClass.getField("densityDpi").getInt(runtime)
+                val wc = XposedHelpers.getObjectField(runtime, "windowConfiguration")
+                val mode = wc?.let {
+                    XposedHelpers.callMethod(it, "getWindowingMode") as? Int
+                }
+                XLog.i(
+                    "restored runtime task configuration task=$taskId " +
+                        "mode=${mode ?: -1} density=$density",
+                )
+            }
+            true
+        }.onFailure {
+            XLog.e("replace stale task config failed task=$taskId", it)
+        }.getOrDefault(false)
+    }
+
+    /**
+     * Make one Configuration internally coherent for the managed task: bounds, app/max bounds,
+     * orientation, dp dimensions and user-selected density all describe the same frame. A fresh
+     * WindowConfiguration prevents these app/report copies from mutating WM's shared record.
+     */
+    private fun canonicalizeManagedFreeformConfig(
+        config: Any,
+        taskId: Int,
+        preferredBounds: android.graphics.Rect?,
+        appFullscreen: Boolean,
+    ): Boolean = runCatching {
+        val originalWc = XposedHelpers.getObjectField(config, "windowConfiguration")
+            ?: return@runCatching false
+        val bounds = preferredBounds?.takeIf { !it.isEmpty }?.let { android.graphics.Rect(it) }
+            ?: (XposedHelpers.callMethod(originalWc, "getBounds") as? android.graphics.Rect)
+                ?.takeIf { !it.isEmpty }
+                ?.let { android.graphics.Rect(it) }
+            ?: return@runCatching false
+        val freshWc = originalWc.javaClass.getConstructor(originalWc.javaClass)
+            .newInstance(originalWc)
+        runCatching { XposedHelpers.callMethod(freshWc, "setBounds", bounds) }
+        runCatching { XposedHelpers.callMethod(freshWc, "setAppBounds", bounds) }
+        runCatching { XposedHelpers.callMethod(freshWc, "setMaxBounds", bounds) }
+        if (appFullscreen) {
+            XposedHelpers.callMethod(
+                freshWc,
+                "setWindowingMode",
+                FreeformPolicy.WINDOWING_MODE_FULLSCREEN,
+            )
+        }
+        XposedHelpers.setObjectField(config, "windowConfiguration", freshWc)
+
+        val requestedDpi = FreeformManagerService.freeformDpiOf(taskId)
+        val currentDpi = config.javaClass.getField("densityDpi").getInt(config)
+        val effectiveDpi = requestedDpi.takeIf { it > 0 }
+            ?: currentDpi.takeIf { it > 0 }
+            ?: SystemServices.systemContext.resources.displayMetrics.densityDpi
+        if (requestedDpi > 0) {
+            config.javaClass.getField("densityDpi").setInt(config, requestedDpi)
+        }
+        val density = effectiveDpi / 160f
+        val wDp = (bounds.width() / density).toInt().coerceAtLeast(1)
+        val hDp = (bounds.height() / density).toInt().coerceAtLeast(1)
+        config.javaClass.getField("screenWidthDp").setInt(config, wDp)
+        config.javaClass.getField("screenHeightDp").setInt(config, hDp)
+        config.javaClass.getField("smallestScreenWidthDp").setInt(config, minOf(wDp, hDp))
+        config.javaClass.getField("orientation")
+            .setInt(config, if (bounds.width() > bounds.height()) 2 else 1)
+        true
+    }.onFailure {
+        XLog.e("canonical freeform config failed task=$taskId", it)
+    }.getOrDefault(false)
 
     /**
      * Put the selected density in the exact Configuration object delivered to the app. Server-side

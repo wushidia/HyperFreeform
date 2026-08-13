@@ -16,7 +16,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBars
 import androidx.compose.foundation.layout.windowInsetsBottomHeight
@@ -32,7 +31,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
@@ -88,7 +86,8 @@ internal fun AboutPage(
     val scrollBehavior = MiuixScrollBehavior()
     val lazyListState = rememberLazyListState()
 
-    val scrollProgress by remember {
+    // 高频滚动值保持为 State，具体数值只在 graphicsLayer 绘制阶段读取，避免整页逐帧重组。
+    val scrollProgressState = remember {
         derivedStateOf {
             when {
                 lazyListState.firstVisibleItemIndex > 0 -> 1f
@@ -104,14 +103,14 @@ internal fun AboutPage(
             }
         }
     }
+    val heroCollapsed by remember { derivedStateOf { scrollProgressState.value == 1f } }
+    val titleAlpha by remember {
+        derivedStateOf { scrollProgressState.value }
+    }
 
     val backdrop = rememberBlurBackdrop()
-    val blurActive = backdrop != null && scrollProgress == 1f
-    val barColor = if (blurActive) {
-        Color.Transparent
-    } else {
-        if (scrollProgress == 1f) colorScheme.surface else Color.Transparent
-    }
+    val blurActive = backdrop != null && heroCollapsed
+    val barColor = if (heroCollapsed && !blurActive) colorScheme.surface else Color.Transparent
 
     Scaffold(
         topBar = {
@@ -121,9 +120,7 @@ internal fun AboutPage(
                     title = stringResource(R.string.about_title),
                     scrollBehavior = scrollBehavior,
                     color = barColor,
-                    titleColor = colorScheme.onSurface.copy(
-                        alpha = ((scrollProgress - 0.35f) / 0.65f).coerceIn(0f, 1f),
-                    ),
+                    titleColor = colorScheme.onSurface.copy(alpha = titleAlpha),
                     defaultWindowInsetsPadding = false,
                     navigationIcon = {
                         val layoutDirection = LocalLayoutDirection.current
@@ -150,7 +147,7 @@ internal fun AboutPage(
                 innerPadding = innerPadding,
                 scrollBehavior = scrollBehavior,
                 lazyListState = lazyListState,
-                scrollProgress = scrollProgress,
+                scrollProgress = { scrollProgressState.value },
                 onOpenUrl = onOpenUrl,
             )
         }
@@ -162,7 +159,7 @@ private fun AboutContent(
     innerPadding: PaddingValues,
     scrollBehavior: ScrollBehavior,
     lazyListState: LazyListState,
-    scrollProgress: Float,
+    scrollProgress: () -> Float,
     onOpenUrl: (String) -> Unit,
 ) {
     val layoutDirection = LocalLayoutDirection.current
@@ -196,9 +193,9 @@ private fun AboutContent(
 
     var logoHeightDp by remember { mutableStateOf(300.dp) }
 
-    val versionCodeProgress = ((scrollProgress - 0.05f) / 0.15f).coerceIn(0f, 1f)
-    val projectNameProgress = ((scrollProgress - 0.20f) / 0.15f).coerceIn(0f, 1f)
-    val iconProgress = ((scrollProgress - 0.35f) / 0.15f).coerceIn(0f, 1f)
+    val versionCodeProgress = { ((scrollProgress() - 0.05f) / 0.15f).coerceIn(0f, 1f) }
+    val projectNameProgress = { ((scrollProgress() - 0.20f) / 0.15f).coerceIn(0f, 1f) }
+    val iconProgress = { ((scrollProgress() - 0.35f) / 0.15f).coerceIn(0f, 1f) }
 
     val scrollPadding = PaddingValues(
         top = innerPadding.calculateTopPadding(),
@@ -217,7 +214,7 @@ private fun AboutContent(
         bgModifier = Modifier.layerBackdrop(backdrop),
         isFullSize = true,
         effectBackground = effectBackground,
-        alpha = { 1f - scrollProgress },
+        alpha = { 1f - scrollProgress() },
     ) {
         Column(
             modifier = Modifier
@@ -235,15 +232,16 @@ private fun AboutContent(
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
-                    .size(100.dp)
+                    .size(88.dp)
                     .graphicsLayer {
-                        alpha = 1 - iconProgress
-                        scaleX = 1 - (iconProgress * 0.05f)
-                        scaleY = 1 - (iconProgress * 0.05f)
+                        val progress = iconProgress()
+                        alpha = 1 - progress
+                        scaleX = 1 - (progress * 0.05f)
+                        scaleY = 1 - (progress * 0.05f)
                     },
             ) {
                 Image(
-                    modifier = Modifier.size(100.dp),
+                    modifier = Modifier.size(80.dp),
                     painter = painterResource(R.drawable.app_icon),
                     contentDescription = stringResource(R.string.app_name),
                 )
@@ -252,9 +250,10 @@ private fun AboutContent(
                 modifier = Modifier
                     .padding(top = 12.dp, bottom = 5.dp)
                     .graphicsLayer {
-                        alpha = 1 - projectNameProgress
-                        scaleX = 1 - (projectNameProgress * 0.05f)
-                        scaleY = 1 - (projectNameProgress * 0.05f)
+                        val progress = projectNameProgress()
+                        alpha = 1 - progress
+                        scaleX = 1 - (progress * 0.05f)
+                        scaleY = 1 - (progress * 0.05f)
                     }
                     .then(
                         if (blurEnabled) {
@@ -277,12 +276,17 @@ private fun AboutContent(
                 modifier = Modifier
                     .fillMaxWidth()
                     .graphicsLayer {
-                        alpha = 1 - versionCodeProgress
-                        scaleX = 1 - (versionCodeProgress * 0.05f)
-                        scaleY = 1 - (versionCodeProgress * 0.05f)
+                        val progress = versionCodeProgress()
+                        alpha = 1 - progress
+                        scaleX = 1 - (progress * 0.05f)
+                        scaleY = 1 - (progress * 0.05f)
                     },
                 color = colorScheme.onSurfaceVariantSummary,
-                text = "v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
+                text = stringResource(
+                    R.string.version_build_fmt,
+                    BuildConfig.VERSION_NAME,
+                    BuildConfig.VERSION_CODE,
+                ),
                 fontSize = 14.sp,
                 textAlign = TextAlign.Center,
             )
@@ -314,53 +318,50 @@ private fun AboutContent(
             }
 
             item(key = "about") {
-                Box {
-                    Spacer(Modifier.fillParentMaxHeight())
-                    Column(
-                        modifier = Modifier.padding(bottom = 12.dp),
-                    ) {
-                        SmallTitle(text = stringResource(R.string.about_open_source))
-                        Card(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 12.dp)
-                                .padding(bottom = 12.dp)
-                                .then(
-                                    if (blurEnabled) {
-                                        Modifier.textureBlur(
-                                            backdrop = backdrop,
-                                            shape = RoundedCornerShape(16.dp),
-                                            blurRadius = 60f,
-                                            colors = BlurColors(blendColors = cardBlendColors),
-                                            enabled = true,
-                                        )
-                                    } else Modifier
-                                ),
-                            colors = CardDefaults.defaultColors(
-                                if (blurEnabled) Color.Transparent else colorScheme.surfaceContainer,
-                                Color.Transparent,
+                Column(
+                    modifier = Modifier
+                        .fillParentMaxHeight()
+                        .padding(bottom = 12.dp),
+                ) {
+                    SmallTitle(text = stringResource(R.string.about_open_source))
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp)
+                            .padding(bottom = 12.dp)
+                            .then(
+                                if (blurEnabled) {
+                                    Modifier.textureBlur(
+                                        backdrop = backdrop,
+                                        shape = RoundedCornerShape(16.dp),
+                                        blurRadius = 60f,
+                                        colors = BlurColors(blendColors = cardBlendColors),
+                                        enabled = true,
+                                    )
+                                } else Modifier
                             ),
-                        ) {
-                            val ossProjects = remember {
-                                listOf(
-                                    "miuix" to "https://github.com/compose-miuix-ui/miuix",
-                                    "AndroidHiddenApiBypass" to "https://github.com/LSPosed/AndroidHiddenApiBypass",
-                                    "AndroidX" to "https://github.com/androidx/androidx",
-                                    "Kotlin" to "https://github.com/JetBrains/kotlin",
-                                    "kotlinx.coroutines" to "https://github.com/Kotlin/kotlinx.coroutines",
-                                )
-                            }
-                            ossProjects.forEach { (name, url) ->
-                                ArrowPreference(
-                                    title = name,
-                                    summary = url.removePrefix("https://"),
-                                    onClick = { onOpenUrl(url) },
-                                )
-                            }
+                        colors = CardDefaults.defaultColors(
+                            if (blurEnabled) Color.Transparent else colorScheme.surfaceContainer,
+                            Color.Transparent,
+                        ),
+                    ) {
+                        val ossProjects = listOf(
+                            stringResource(R.string.oss_miuix) to stringResource(R.string.oss_url_miuix),
+                            stringResource(R.string.oss_hidden_api) to stringResource(R.string.oss_url_hidden_api),
+                            stringResource(R.string.oss_androidx) to stringResource(R.string.oss_url_androidx),
+                            stringResource(R.string.oss_kotlin) to stringResource(R.string.oss_url_kotlin),
+                            stringResource(R.string.oss_coroutines) to stringResource(R.string.oss_url_coroutines),
+                        )
+                        ossProjects.forEach { (name, url) ->
+                            ArrowPreference(
+                                title = name,
+                                summary = url.removePrefix("https://"),
+                                onClick = { onOpenUrl(url) },
+                            )
                         }
-
-                        Spacer(Modifier.windowInsetsBottomHeight(WindowInsets.systemBars))
                     }
+
+                    Spacer(Modifier.windowInsetsBottomHeight(WindowInsets.systemBars))
                 }
             }
         }

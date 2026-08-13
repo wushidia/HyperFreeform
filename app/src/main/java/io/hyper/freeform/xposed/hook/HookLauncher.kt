@@ -20,6 +20,7 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import io.hyper.freeform.service.FreeformBridge
 import io.hyper.freeform.service.FreeformManagerClient
 import io.hyper.freeform.xposed.utils.XLog
 import java.lang.ref.WeakReference
@@ -338,6 +339,18 @@ object HookLauncher {
                             XposedHelpers.callMethod(gestureState, "getContainerInterface")
                         }.getOrNull() ?: return
                         val container = createdLauncherContainer(containerInterface) ?: return
+                        val freeformTaskId = taskInfoId(freeformTask)
+                        if (!isForegroundMiniConversionAllowed(container, freeformTaskId)) {
+                            // Launcher can hold a stale freeform TaskInfo for one or two frames
+                            // after the system-server mode switch. Do not replace Quickstep's
+                            // normal consumer in that window: the maximized task must navigate
+                            // to HOME/Recents as a regular fullscreen task.
+                            XLog.d(
+                                "$TAG keep stock navigation consumer for maximized task=" +
+                                    freeformTaskId,
+                            )
+                            return
+                        }
                         val inputMonitor = param.args.firstOrNull {
                             it?.javaClass?.name ==
                                 "com.android.systemui.shared.system.InputMonitorCompat"
@@ -358,7 +371,7 @@ object HookLauncher {
                         param.result = replacement
                         XLog.i(
                             "$TAG routed overview gesture to visible HOME behind freeform " +
-                                "task=${taskInfoId(freeformTask)}",
+                                "task=$freeformTaskId",
                         )
                     }
                 },
@@ -488,7 +501,11 @@ object HookLauncher {
             return
         }
         XLog.i("$TAG otherActivity foreground swipe task=$taskId progress=$progress")
-        triggerFromRecent(taskId, "FOREGROUND_SWIPE")
+        triggerFromRecent(
+            taskId,
+            "FOREGROUND_SWIPE",
+            getFieldUp(handler, "mRecentsView") ?: handler,
+        )
         resetForegroundSwipeMotion()
     }
 
@@ -521,7 +538,11 @@ object HookLauncher {
             return
         }
         XLog.i("$TAG foreground swipe task=$taskId progress=$progress")
-        triggerFromRecent(taskId, "FOREGROUND_SWIPE")
+        triggerFromRecent(
+            taskId,
+            "FOREGROUND_SWIPE",
+            getFieldUp(handler, "mRecentsView") ?: handler,
+        )
         resetForegroundSwipeMotion()
     }
 
@@ -986,10 +1007,16 @@ object HookLauncher {
 
     // region Trigger
 
-    private fun triggerFromRecent(taskId: Int, reason: String): Boolean {
+    private fun triggerFromRecent(taskId: Int, reason: String, contextHost: Any? = null): Boolean {
         val now = SystemClock.uptimeMillis()
         if (now - lastTriggerUptime < 900L) {
             XLog.d("$TAG debounce skip task=$taskId reason=$reason")
+            return false
+        }
+        if (contextHost != null && !isForegroundMiniConversionAllowed(contextHost, taskId)) {
+            XLog.i(
+                "$TAG letting stock HOME/Recents handle swipe for maximized task=$taskId",
+            )
             return false
         }
         if (!FreeformManagerClient.isReady()) {
@@ -1012,21 +1039,40 @@ object HookLauncher {
     }
 
     private fun isRecentsFreeformEnabled(host: Any): Boolean {
-        val ctx: Context? = when (host) {
-            is View -> host.context
-            is Context -> host
-            else -> runCatching {
-                (XposedHelpers.callMethod(host, "asContext") as? Context)
-                    ?: (XposedHelpers.getObjectField(host, "mContainer") as? Context)
-                    ?: ((XposedHelpers.getObjectField(host, "mContainer") as? View)?.context)
-            }.getOrNull()
-        }
+        val ctx = resolveHostContext(host)
         if (ctx != null) FreeformManagerClient.initialize(ctx)
         if (!FreeformManagerClient.isEnabled()) return false
         val cr = ctx?.contentResolver ?: return true
         return runCatching {
             Settings.Global.getInt(cr, SETTINGS_RECENTS_FREEFORM, 1) != 0
         }.getOrDefault(true)
+    }
+
+    private fun resolveHostContext(host: Any): Context? = when (host) {
+            is View -> host.context
+            is Context -> host
+            else -> runCatching {
+                (XposedHelpers.callMethod(host, "asContext") as? Context)
+                    ?: (XposedHelpers.callMethod(host, "getContext") as? Context)
+                    ?: (XposedHelpers.callMethod(host, "getActivityContext") as? Context)
+                    ?: (XposedHelpers.getObjectField(host, "mContainer") as? Context)
+                    ?: ((XposedHelpers.getObjectField(host, "mContainer") as? View)?.context)
+            }.getOrNull()
+        }
+
+    private fun isForegroundMiniConversionAllowed(host: Any, taskId: Int): Boolean {
+        val ctx = resolveHostContext(host) ?: return true
+        val blocked = runCatching {
+            Settings.Global.getString(
+                ctx.contentResolver,
+                FreeformBridge.SETTING_SUPPRESS_FOREGROUND_MINI_TASKS,
+            ).orEmpty()
+                .split(',')
+                .asSequence()
+                .map(String::trim)
+                .any { it == taskId.toString() }
+        }.getOrDefault(false)
+        return !blocked
     }
 
     // endregion

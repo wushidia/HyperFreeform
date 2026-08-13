@@ -24,8 +24,8 @@ android {
         applicationId = "io.hyper.freeform"
         minSdk = 33
         targetSdk = 35
-        versionCode = 100
-        versionName = "1.0.0"
+        versionCode = 112
+        versionName = "1.0.12"
     }
 
     signingConfigs {
@@ -75,9 +75,11 @@ dependencies {
     val composeBom = platform(libs.androidx.compose.bom)
     implementation(composeBom)
     implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.navigationevent.compose)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.foundation)
+    implementation(libs.androidx.compose.material.icons.extended)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.miuix.ui)
     implementation(libs.miuix.blur)

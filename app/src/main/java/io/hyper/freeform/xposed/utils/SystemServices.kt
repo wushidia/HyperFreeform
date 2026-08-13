@@ -72,10 +72,65 @@ object SystemServices {
 
     /**
      * Best-effort IME visible height in px (Xiaomi DisplayInfo.getImeHeight source).
-     * Tries WindowManagerInternal then DisplayContent InputMethod frame.
+     * Prefer InsetsSource: modern IMEs use a full-display host window, so that WindowState's frame
+     * height is not the keyboard's occluded height on some OEM builds.
      */
     fun imeVisibleHeight(displayId: Int = Display.DEFAULT_DISPLAY): Int {
-        // 1) WindowManagerInternal.getInputMethodWindowVisibleHeight(displayId)
+        val displayHeight = runCatching {
+            windowManager.currentWindowMetrics.bounds.height()
+        }.getOrDefault(0)
+        fun plausible(value: Int): Boolean =
+            value > 0 && (displayHeight <= 0 || value <= displayHeight * 3 / 4)
+
+        // 1) ImeInsetsSourceProvider: authoritative occluded frame / control hint.
+        runCatching {
+            val rwc = rootWindowContainer() ?: return@runCatching
+            val getDisplayContent = rwc.javaClass.methods.firstOrNull {
+                it.name == "getDisplayContent" && it.parameterTypes.size == 1 &&
+                    it.parameterTypes[0] == Integer.TYPE
+            } ?: return@runCatching
+            val dc = getDisplayContent.invoke(rwc, displayId) ?: return@runCatching
+            val provider = callNoArg(dc, "getImeInsetsSourceProvider")
+                ?: fieldGet(dc, "mImeInsetsSourceProvider")
+            if (provider != null) {
+                val source = callNoArg(provider, "getSource") ?: fieldGet(provider, "mSource")
+                if (source != null) {
+                    val visible = runCatching {
+                        callNoArg(source, "isVisible") as? Boolean
+                    }.getOrNull() ?: (fieldGet(source, "mVisible") as? Boolean) ?: false
+                    if (visible) {
+                        val frame = callNoArg(source, "getFrame") as? Rect
+                            ?: fieldGet(source, "mFrame") as? Rect
+                        val sourceHeight = frame?.height() ?: 0
+                        if (plausible(sourceHeight)) return sourceHeight
+                        val control = fieldGet(provider, "mControl")
+                        val hint = control?.let {
+                            callNoArg(it, "getInsetsHint") ?: fieldGet(it, "mInsetsHint")
+                        } as? android.graphics.Insets
+                        if (hint != null && plausible(hint.bottom)) return hint.bottom
+                    }
+                }
+            }
+            // Legacy non-fullscreen IME windows still expose a useful frame.
+            val imeWin = fieldGet(dc, "mInputMethodWindow")
+            val imeVisible = imeWin?.let {
+                runCatching { callNoArg(it, "isVisible") as? Boolean }.getOrNull()
+            } == true
+            if (imeWin != null && imeVisible) {
+                val frame = callNoArg(imeWin, "getFrame") as? Rect
+                    ?: fieldGet(imeWin, "mFrame") as? Rect
+                    ?: fieldGet(imeWin, "mWindowFrames")?.let { fieldGet(it, "mFrame") as? Rect }
+                if (frame != null) {
+                    val dockedHeight = if (displayHeight > 0 && frame.top in 1 until displayHeight) {
+                        displayHeight - frame.top
+                    } else {
+                        frame.height()
+                    }
+                    if (plausible(dockedHeight)) return dockedHeight
+                }
+            }
+        }
+        // 2) WindowManagerInternal fallback. Reject full-display IME host windows.
         runCatching {
             val localServices = Class.forName("com.android.server.LocalServices")
             val wmiClass = Class.forName("com.android.server.wm.WindowManagerInternal")
@@ -88,48 +143,8 @@ object SystemServices {
                     1 -> m.invoke(wmi, displayId)
                     else -> continue
                 }
-                if (value is Int && value >= 0) return value
-            }
-        }
-        // 2) DisplayContent input method window frame height
-        runCatching {
-            val rwc = rootWindowContainer() ?: return@runCatching
-            val getDisplayContent = rwc.javaClass.methods.firstOrNull {
-                it.name == "getDisplayContent" && it.parameterTypes.size == 1 &&
-                    it.parameterTypes[0] == Integer.TYPE
-            } ?: return@runCatching
-            val dc = getDisplayContent.invoke(rwc, displayId) ?: return@runCatching
-            val imeWin = fieldGet(dc, "mInputMethodWindow")
-                ?: callNoArg(dc, "getImeLayeringTarget")
-            if (imeWin != null) {
-                val frame = callNoArg(imeWin, "getFrame") as? Rect
-                    ?: fieldGet(imeWin, "mFrame") as? Rect
-                    ?: fieldGet(imeWin, "mWindowFrames")?.let { fieldGet(it, "mFrame") as? Rect }
-                if (frame != null && frame.height() > 0) {
-                    val ( _, dh) = runCatching {
-                        val bounds = windowManager.currentWindowMetrics.bounds
-                        bounds.width() to bounds.height()
-                    }.getOrDefault(0 to 0)
-                    // Visible IME height is distance from frame top to display bottom when docked bottom.
-                    if (dh > 0 && frame.top in 1 until dh) return (dh - frame.top).coerceAtLeast(0)
-                    return frame.height()
-                }
-            }
-            // ImeInsetsSourceProvider path
-            val provider = callNoArg(dc, "getImeInsetsSourceProvider")
-                ?: fieldGet(dc, "mImeInsetsSourceProvider")
-            if (provider != null) {
-                val source = callNoArg(provider, "getSource") ?: fieldGet(provider, "mSource")
-                if (source != null) {
-                    val visible = runCatching {
-                        callNoArg(source, "isVisible") as? Boolean
-                    }.getOrNull() ?: true
-                    if (visible) {
-                        val frame = callNoArg(source, "getFrame") as? Rect
-                            ?: fieldGet(source, "mFrame") as? Rect
-                        if (frame != null && frame.height() > 0) return frame.height()
-                    }
-                }
+                if (value is Int && value == 0) return 0
+                if (value is Int && plausible(value)) return value
             }
         }
         return 0
@@ -285,6 +300,26 @@ object SystemServices {
             ?: runCatching { fieldGet(task, "mBounds") as? Rect }.getOrNull()
             ?: return null
         return Rect(bounds)
+    }
+
+    /** Current WM windowing mode for a task, resolved from the task itself at runtime. */
+    fun taskWindowingMode(taskId: Int): Int? {
+        val task = findTask(taskId) ?: return null
+        return runCatching { callNoArg(task, "getWindowingMode") as? Int }.getOrNull()
+            ?: runCatching {
+                val cfg = callNoArg(task, "getConfiguration") ?: return@runCatching null
+                val wc = fieldGet(cfg, "windowConfiguration") ?: return@runCatching null
+                callNoArg(wc, "getWindowingMode") as? Int
+            }.getOrNull()
+    }
+
+    /** Snapshot of the task's current resolved Configuration; callers receive an independent copy. */
+    fun taskConfiguration(taskId: Int): Any? {
+        val task = findTask(taskId) ?: return null
+        val cfg = runCatching { callNoArg(task, "getConfiguration") }.getOrNull() ?: return null
+        return runCatching {
+            cfg.javaClass.getConstructor(cfg.javaClass).newInstance(cfg)
+        }.getOrElse { cfg }
     }
 
     /** True only after the task's real base-application window (not StartingWindow) is drawn. */
@@ -497,10 +532,43 @@ object SystemServices {
         val task = findTask(taskId) ?: return false
         return withGlobalLock {
             val applied = setTaskAlwaysOnTop(task, onTop)
+            // Freeform may be focused, but it must not steal immersive system-bar control.
+            setTaskCanAffectSystemUiFlagsLocked(task, canAffect = !onTop)
             runCatching { callNoArg(task, "ensureActivitiesVisible") }
             if (applied) XLog.d("setFreeformAlwaysOnTop task=$taskId onTop=$onTop")
             applied
         }
+    }
+
+    /**
+     * Overlay windows default to fitting status/navigation bars, which forces those bars visible
+     * the moment a small-window chrome or sidebar is shown over an immersive app.
+     */
+    fun applyOverlaySystemUiPassthrough(lp: WindowManager.LayoutParams) {
+        runCatching {
+            lp.javaClass.getMethod("setFitInsetsTypes", Integer.TYPE).invoke(lp, 0)
+        }
+        runCatching {
+            lp.javaClass.getMethod("setFitInsetsSides", Integer.TYPE).invoke(lp, 0)
+        }
+        runCatching {
+            lp.javaClass.getMethod("setFitInsetsIgnoringVisibility", java.lang.Boolean.TYPE)
+                .invoke(lp, true)
+        }
+        runCatching {
+            lp.javaClass.getField("layoutInDisplayCutoutMode").setInt(lp, 3) // ALWAYS
+        }
+    }
+
+    private fun setTaskCanAffectSystemUiFlagsLocked(task: Any, canAffect: Boolean) {
+        runCatching {
+            val m = task.javaClass.methods.firstOrNull {
+                it.name == "setCanAffectSystemUiFlags" && it.parameterTypes.size == 1 &&
+                    it.parameterTypes[0] == java.lang.Boolean.TYPE
+            }
+            m?.invoke(task, canAffect)
+        }
+        fieldSetBoolean(task, "mCanAffectSystemUiFlags", canAffect)
     }
 
     private fun setTaskAlwaysOnTop(task: Any, onTop: Boolean): Boolean {
@@ -779,6 +847,58 @@ object SystemServices {
     }
 
     /**
+     * Fullscreen/split exit must not keep the in-window DPI override: writes densityDpi back to
+     * DENSITY_DPI_UNDEFINED (0) on the task's REQUESTED override configuration and commits, so the
+     * app re-renders at the system density. No-ops when there is nothing to clear, so callers can
+     * use it unconditionally as a safety net after windowing-mode transitions — some OEM builds
+     * silently skip parts of the task/config exit paths and would otherwise keep the
+     * freeform density on a fullscreen task.
+     */
+    fun clearTaskDensityOverride(taskId: Int): Boolean {
+        return runCatching {
+            val task = findTask(taskId) ?: return false
+            withGlobalLock {
+                val getCfg = task.javaClass.methods.firstOrNull {
+                    it.name == "getRequestedOverrideConfiguration" && it.parameterTypes.isEmpty()
+                } ?: return@withGlobalLock false
+                val cfg = getCfg.invoke(task) ?: return@withGlobalLock false
+                val field = cfg.javaClass.getField("densityDpi")
+                val previous = field.getInt(cfg)
+                if (previous == 0) return@withGlobalLock false
+                // Copy so WM diff-checks against the current one and sees a real change.
+                val cfgCopy = runCatching {
+                    cfg.javaClass.getConstructor(cfg.javaClass).newInstance(cfg)
+                }.getOrDefault(cfg)
+                cfgCopy.javaClass.getField("densityDpi").setInt(cfgCopy, 0)
+                task.javaClass.methods.firstOrNull {
+                    it.name == "onRequestedOverrideConfigurationChanged" &&
+                        it.parameterTypes.size == 1
+                }?.invoke(task, cfgCopy) ?: return@withGlobalLock false
+                // Nudge the top activity so the restored system density reaches the client even
+                // when WM skips its own dispatch on this OEM build.
+                runCatching {
+                    val top = callNoArg(task, "getTopNonFinishingActivity")
+                        ?: callNoArg(task, "topRunningActivityLocked")
+                    if (top != null) {
+                        top.javaClass.methods.firstOrNull {
+                            it.name == "ensureActivityConfiguration" && it.parameterTypes.size <= 2
+                        }?.let { m ->
+                            when (m.parameterTypes.size) {
+                                0 -> m.invoke(top)
+                                1 -> m.invoke(top, 0)
+                                else -> m.invoke(top, 0, false)
+                            }
+                        }
+                    }
+                }
+                XLog.i("cleared task density override task=$taskId $previous->0")
+                true
+            }
+        }.onFailure { XLog.e("clearTaskDensityOverride task=$taskId failed", it) }
+            .getOrDefault(false)
+    }
+
+    /**
      * The top activity's WM-RESOLVED window bounds. After a task resize commit, WM may re-resolve
      * the leaf activity LARGER than the task (per-app min size / aspect enforcement — e.g. bilibili
      * re-expands to an 880px-wide floor) → content overflows the chrome frame. Read this back to
@@ -1002,6 +1122,7 @@ object SystemServices {
         sourceBounds: Rect,
         visualBounds: Rect,
         miniStyle: Boolean = true,
+        logResult: Boolean = true,
     ): Boolean {
         return runCatching {
             val task = findTask(taskId) ?: return@runCatching false
@@ -1059,11 +1180,13 @@ object SystemServices {
                     )
             }
             txClass.getMethod("apply").invoke(tx)
-            XLog.d(
-                "scaledVisual task=$taskId mini=$miniStyle source=$sourceBounds " +
-                    "visual=$visualBounds scale=$scale visibleRadius=$visibleRadius " +
-                    "leashRadius=$leashRadius",
-            )
+            if (logResult) {
+                XLog.d(
+                    "scaledVisual task=$taskId mini=$miniStyle source=$sourceBounds " +
+                        "visual=$visualBounds scale=$scale visibleRadius=$visibleRadius " +
+                        "leashRadius=$leashRadius",
+                )
+            }
             true
         }.onFailure {
             XLog.e("applyMiniFreeformVisual task=$taskId failed", it)
@@ -1097,6 +1220,7 @@ object SystemServices {
         return withGlobalLock {
             var ok = false
             ok = setTaskAlwaysOnTop(task, false) || ok
+            setTaskCanAffectSystemUiFlagsLocked(task, canAffect = true)
 
             // Clear override bounds first (Xiaomi setBounds(null)).
             runCatching {
@@ -1153,6 +1277,11 @@ object SystemServices {
                 }?.invoke(task, cfgCopy)
                 ok = true
             }.onFailure { XLog.e("exitTaskToFullscreen config path failed", it) }
+
+            // Safety net: on some OEM builds the reflection paths above only
+            // partially apply, leaving the freeform densityDpi on the now-fullscreen task.
+            // No-ops when the override is already cleared by the config path.
+            clearTaskDensityOverride(taskId)
 
             // A normal ActivityStarter launch already owns the pending transition. Avoid a nested
             // ATM Binder mode request from its hook; the direct Task/config paths above are enough.
@@ -1287,6 +1416,9 @@ object SystemServices {
                 }?.invoke(task, cfg)
                 ok = true
             }.onFailure { XLog.e("exitTaskToSplit config path failed", it) }
+
+            // Split is a system mode too: drop the in-window DPI override (no-op if already 0).
+            clearTaskDensityOverride(taskId)
 
             runCatching { callNoArg(task, "ensureActivitiesVisible") }
             runCatching {
@@ -1590,6 +1722,133 @@ object SystemServices {
     ): Boolean = applyCloseVisual(taskId, sourceBounds, frame)
 
     /**
+     * Generic MIUI-style transition frame on the task leash (maximize/split/mini/rotation):
+     * scale+position+alpha from [frame] relative to [sourceBounds], corner radius lerped from
+     * [fromRadius] to [toRadius] by [sizeProgress] (visible px; divided by scale for leash space).
+     * Visual only — no resizeTask, so no config thrash mid-animation.
+     */
+    fun applyTransitionVisual(
+        taskId: Int,
+        sourceBounds: Rect,
+        frame: io.hyper.freeform.xposed.policy.FreeformPolicy.WindowVisualFrame,
+        fromRadius: Float,
+        toRadius: Float,
+        sizeProgress: Float,
+    ): Boolean {
+        return runCatching {
+            val task = findTask(taskId) ?: return@runCatching false
+            val leash = fieldGet(task, "mSurfaceControl")
+                ?: callNoArg(task, "getSurfaceControl")
+                ?: return@runCatching false
+            val scClass = Class.forName("android.view.SurfaceControl")
+            val txClass = Class.forName("android.view.SurfaceControl\$Transaction")
+            val tx = txClass.getDeclaredConstructor().newInstance()
+            val srcW = sourceBounds.width().coerceAtLeast(1).toFloat()
+            val srcH = sourceBounds.height().coerceAtLeast(1).toFloat()
+            val scale = minOf(frame.width / srcW, frame.height / srcH).coerceIn(0.05f, 2.5f)
+            leashSetScale(txClass, scClass, tx, leash, scale, scale)
+            runCatching {
+                txClass.getMethod(
+                    "setPosition",
+                    scClass,
+                    java.lang.Float.TYPE,
+                    java.lang.Float.TYPE,
+                ).invoke(tx, leash, frame.left, frame.top)
+            }
+            runCatching {
+                txClass.getMethod("setAlpha", scClass, java.lang.Float.TYPE)
+                    .invoke(tx, leash, frame.alpha)
+            }
+            val cropW = srcW.toInt().coerceAtLeast(1)
+            val cropH = srcH.toInt().coerceAtLeast(1)
+            runCatching {
+                txClass.getMethod("setWindowCrop", scClass, Rect::class.java)
+                    .invoke(tx, leash, Rect(0, 0, cropW, cropH))
+            }.recoverCatching {
+                txClass.getMethod("setWindowCrop", scClass, Integer.TYPE, Integer.TYPE)
+                    .invoke(tx, leash, cropW, cropH)
+            }
+            val sp = sizeProgress.coerceIn(0f, 1f)
+            val visibleRadius = fromRadius + (toRadius - fromRadius) * sp
+            runCatching {
+                txClass.getMethod("setCornerRadius", scClass, java.lang.Float.TYPE)
+                    .invoke(tx, leash, visibleRadius / scale)
+            }
+            txClass.getMethod("apply").invoke(tx)
+            true
+        }.onFailure {
+            XLog.e("applyTransitionVisual task=$taskId failed", it)
+        }.getOrDefault(false)
+    }
+
+    /** Apply an aspect-preserving fullscreen transition to a leash whose local buffer is full-size. */
+    fun applyFullscreenTransitionVisual(
+        taskId: Int,
+        frame: io.hyper.freeform.xposed.policy.FreeformPolicy.WindowVisualFrame,
+        fromRadius: Float,
+        toRadius: Float,
+        sizeProgress: Float,
+    ): Boolean {
+        return runCatching {
+            val task = findTask(taskId) ?: return@runCatching false
+            val leash = fieldGet(task, "mSurfaceControl")
+                ?: callNoArg(task, "getSurfaceControl")
+                ?: return@runCatching false
+            val scClass = Class.forName("android.view.SurfaceControl")
+            val txClass = Class.forName("android.view.SurfaceControl\$Transaction")
+            val tx = txClass.getDeclaredConstructor().newInstance()
+            val display = displayManager.getDisplay(Display.DEFAULT_DISPLAY)
+            val metrics = android.util.DisplayMetrics()
+            @Suppress("DEPRECATION")
+            display.getRealMetrics(metrics)
+            val fullW = metrics.widthPixels.coerceAtLeast(1).toFloat()
+            val fullH = metrics.heightPixels.coerceAtLeast(1).toFloat()
+            // Uniform cover scale keeps content aspect ratio intact. A centered crop then trims
+            // only the dimension which would otherwise exceed the animated outer frame.
+            val scale = maxOf(frame.width / fullW, frame.height / fullH).coerceIn(0.05f, 1f)
+            val cropW = (frame.width / scale).coerceAtMost(fullW).coerceAtLeast(1f)
+            val cropH = (frame.height / scale).coerceAtMost(fullH).coerceAtLeast(1f)
+            val cropLeft = ((fullW - cropW) / 2f).toInt().coerceAtLeast(0)
+            val cropTop = ((fullH - cropH) / 2f).toInt().coerceAtLeast(0)
+            val crop = Rect(
+                cropLeft,
+                cropTop,
+                (cropLeft + cropW).toInt().coerceAtMost(fullW.toInt()),
+                (cropTop + cropH).toInt().coerceAtMost(fullH.toInt()),
+            )
+            leashSetScale(txClass, scClass, tx, leash, scale, scale)
+            txClass.getMethod(
+                "setPosition", scClass, java.lang.Float.TYPE, java.lang.Float.TYPE,
+            ).invoke(
+                tx,
+                leash,
+                frame.left - crop.left * scale,
+                frame.top - crop.top * scale,
+            )
+            runCatching {
+                txClass.getMethod("setAlpha", scClass, java.lang.Float.TYPE)
+                    .invoke(tx, leash, frame.alpha)
+            }
+            runCatching {
+                txClass.getMethod("setWindowCrop", scClass, Rect::class.java)
+                    .invoke(tx, leash, crop)
+            }.recoverCatching {
+                txClass.getMethod("setWindowCrop", scClass, Integer.TYPE, Integer.TYPE)
+                    .invoke(tx, leash, crop.width(), crop.height())
+            }
+            val p = sizeProgress.coerceIn(0f, 1f)
+            val radius = (fromRadius + (toRadius - fromRadius) * p) / scale
+            runCatching {
+                txClass.getMethod("setCornerRadius", scClass, java.lang.Float.TYPE)
+                    .invoke(tx, leash, radius)
+            }
+            txClass.getMethod("apply").invoke(tx)
+            true
+        }.onFailure { XLog.e("applyFullscreenTransitionVisual task=$taskId failed", it) }
+            .getOrDefault(false)
+    }
+
+    /**
      * Restore leash after pin-anim interrupt / before unpin show.
      * Identity matrix + original freeform position + full alpha/crop/radius.
      */
@@ -1843,6 +2102,21 @@ object SystemServices {
                 val f = c.getDeclaredField(field)
                 f.isAccessible = true
                 f.setInt(obj, value)
+                return true
+            } catch (_: Throwable) {
+                c = c.superclass
+            }
+        }
+        return false
+    }
+
+    private fun fieldSetBoolean(obj: Any, field: String, value: Boolean): Boolean {
+        var c: Class<*>? = obj.javaClass
+        while (c != null) {
+            try {
+                val f = c.getDeclaredField(field)
+                f.isAccessible = true
+                f.setBoolean(obj, value)
                 return true
             } catch (_: Throwable) {
                 c = c.superclass

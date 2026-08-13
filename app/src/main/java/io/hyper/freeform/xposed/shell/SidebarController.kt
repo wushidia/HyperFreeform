@@ -243,10 +243,7 @@ object SidebarController {
                 title = "HyperFreeformSidebarEdge"
                 windowAnimations = 0
                 markTrusted(this)
-                runCatching {
-                    val field = javaClass.getField("layoutInDisplayCutoutMode")
-                    field.setInt(this, 1) // LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-                }
+                SystemServices.applyOverlaySystemUiPassthrough(this)
             }
             wm.addView(v, lp)
             edge = v
@@ -358,7 +355,8 @@ object SidebarController {
                 WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                     WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
                     WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
@@ -367,6 +365,7 @@ object SidebarController {
                 gravity = Gravity.TOP or Gravity.START
                 title = "HyperFreeformSidebarPanel"
                 markTrusted(this)
+                SystemServices.applyOverlaySystemUiPassthrough(this)
             }
             wm.addView(p, lp)
             panel = p

@@ -4,6 +4,7 @@
     <string name="xposed_description">HyperOS 风格自由窗口（小窗）模块：原生 freeform + 状态机，非 VirtualDisplay。</string>
     <string name="app_picker_title">选择应用</string>
     <string name="app_picker_hint">点击普通小窗 · 长按迷你小窗</string>
+    <string name="app_picker_count_fmt">%1$d 个应用 · 点击普通小窗，长按迷你小窗</string>
     <string name="tile_label">自由窗口</string>
     <string name="home_title">自由窗口</string>
     <string name="nav_home">首页</string>
@@ -31,6 +32,10 @@
     <string name="home_system_service">系统服务</string>
     <string name="home_ready">已就绪</string>
     <string name="home_not_ready">未就绪</string>
+    <string name="home_status_active_summary">模块与系统服务均已就绪</string>
+    <string name="home_status_module_inactive_summary">LSPosed 模块未激活，请检查作用域后重启 system_server</string>
+    <string name="home_status_service_inactive_summary">模块已激活，但系统服务未就绪，请重启 system_server</string>
+    <string name="home_status_detail_fmt">%1$s · %2$s</string>
     <string name="runtime_info_title">运行信息</string>
     <string name="current_windows">当前窗口</string>
     <string name="module_version">模块版本</string>
@@ -38,6 +43,8 @@
     <string name="about_entry_summary">版本、实现信息与开源说明</string>
     <string name="about_open_source">开放源代码许可</string>
     <string name="version_fmt">版本 %1$s</string>
+    <string name="version_build_fmt">v%1$s (%2$d)</string>
+    <string name="percent_fmt">%1$d%%</string>
     <string name="module_active">LSPosed 模块已激活</string>
     <string name="module_inactive">LSPosed 模块未激活</string>
     <string name="service_ready">system_server 服务就绪</string>
@@ -92,6 +99,18 @@
     <string name="sidebar_apps_title">侧边栏应用</string>
     <string name="sidebar_apps_entry">侧边栏显示的应用</string>
     <string name="sidebar_apps_hint">勾选要在侧边栏显示的应用；不勾选任何应用时默认显示全部可启动应用。</string>
+    <string name="sidebar_apps_count_fmt">应用列表 · 已选择 %1$d / 当前显示 %2$d</string>
+    <string name="no_matching_apps">没有符合条件的应用</string>
+    <string name="oss_miuix">miuix</string>
+    <string name="oss_url_miuix">https://github.com/compose-miuix-ui/miuix</string>
+    <string name="oss_hidden_api">AndroidHiddenApiBypass</string>
+    <string name="oss_url_hidden_api">https://github.com/LSPosed/AndroidHiddenApiBypass</string>
+    <string name="oss_androidx">AndroidX</string>
+    <string name="oss_url_androidx">https://github.com/androidx/androidx</string>
+    <string name="oss_kotlin">Kotlin</string>
+    <string name="oss_url_kotlin">https://github.com/JetBrains/kotlin</string>
+    <string name="oss_coroutines">kotlinx.coroutines</string>
+    <string name="oss_url_coroutines">https://github.com/Kotlin/kotlinx.coroutines</string>
     <string name="sidebar_show_app_names">显示应用名称</string>
     <string name="sidebar_show_app_names_summary">在侧边栏图标下方显示应用名称，最多两行；关闭时使用小米风格窄浮条</string>
     <string name="about_body">本模块按小米 HyperOS 自由窗口架构实现：\n• 状态权威在 system_server\n• windowState：普通 / 迷你 / 贴边 pin\n• 手势：拖动、角缩放、上滑关闭、下滑全屏、边缘 pin\n• pin 保留 Task（挂起不重载）\n• 通知下滑启动小窗（非 VirtualDisplay）\n• 多窗自动避让，避免完全重叠\n• 圆角/描边/角标/浮球贴边露出（小米视觉）\n• 超数量时按最近使用替换\n• 不使用 Z-Flow VirtualDisplay 路线\n• 侧边栏滑动呼出（可左右、记忆位置）\n• 小窗上下圆角统一并跟随系统</string>

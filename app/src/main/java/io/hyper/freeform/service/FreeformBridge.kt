@@ -59,6 +59,9 @@ object FreeformBridge {
     const val SETTING_DPI_PERCENT = "hyper_freeform_dpi_percent_v2"
     const val SETTING_WINDOW_WIDTH_PERCENT = "hyper_freeform_window_width_percent"
     const val SETTING_WINDOW_HEIGHT_PERCENT = "hyper_freeform_window_height_percent"
+    /** Comma-separated task ids which were just maximized from freeform. */
+    const val SETTING_SUPPRESS_FOREGROUND_MINI_TASKS =
+        "hyper_freeform_suppress_foreground_mini_tasks"
 
     const val DEFAULT_DPI_PERCENT = 100
     const val MIN_DPI_PERCENT = 0

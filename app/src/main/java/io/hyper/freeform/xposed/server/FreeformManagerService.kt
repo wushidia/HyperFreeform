@@ -66,6 +66,8 @@ object FreeformManagerService : IFreeformManager.Stub() {
     }
 
     private val tasks = ConcurrentHashMap<Int, FreeformTaskState>()
+    /** Tasks maximized from freeform must keep the stock HOME/Recents swipe semantics. */
+    private val suppressForegroundMiniTasks = ConcurrentHashMap.newKeySet<Int>()
     private var shell: FreeformShellController? = null
     private val pendingPinFinish = java.util.concurrent.ConcurrentHashMap<Int, Runnable>()
     private val pendingLaunchSplashChecks = java.util.concurrent.ConcurrentHashMap<String, Runnable>()
@@ -78,6 +80,8 @@ object FreeformManagerService : IFreeformManager.Stub() {
     private val visualGuardRunnables = java.util.concurrent.ConcurrentHashMap<Int, Runnable>()
     /** Xiaomi pin shrink visual frame ticks (Folme setPinAnimInfo lite). */
     private val pendingPinVisual = java.util.concurrent.ConcurrentHashMap<Int, Runnable>()
+    /** Post-WM fullscreen settle animation; unlike freeform transitions it survives task tracking removal. */
+    private val fullscreenAnimRunnables = ConcurrentHashMap<Int, TransitionAnimSession>()
 
     @Volatile private var imeVisible: Boolean = false
     @Volatile private var imeHeight: Int = 0
@@ -103,6 +107,10 @@ object FreeformManagerService : IFreeformManager.Stub() {
         }
         ensureMuMuDebugPersistence()
         ensureMuMuSystemUiCaptionSuppression()
+        // Task ids are only meaningful within this system_server lifetime. Drop stale markers
+        // after a reboot so a later task-id reuse cannot disable the normal navigation gesture.
+        suppressForegroundMiniTasks.clear()
+        persistSuppressedForegroundMiniTasks()
         ensureFreeformSupport()
         shell = FreeformShellController()
         shell?.start()
@@ -125,6 +133,93 @@ object FreeformManagerService : IFreeformManager.Stub() {
         }
         XLog.i("$TAG ready, freeform support enabled")
         mainHandler.post(imePollRunnable)
+    }
+
+    private fun persistSuppressedForegroundMiniTasks() {
+        runCatching {
+            val csv = suppressForegroundMiniTasks
+                .asSequence()
+                .sorted()
+                .joinToString(",")
+            Settings.Global.putString(
+                SystemServices.systemContext.contentResolver,
+                FreeformBridge.SETTING_SUPPRESS_FOREGROUND_MINI_TASKS,
+                csv,
+            )
+        }.onFailure { XLog.e("$TAG persist swipe suppression failed", it) }
+    }
+
+    private fun suppressForegroundMiniForTask(taskId: Int) {
+        if (taskId > 0 && suppressForegroundMiniTasks.add(taskId)) {
+            persistSuppressedForegroundMiniTasks()
+            XLog.d("suppress foreground swipe→mini task=$taskId")
+        }
+    }
+
+    private fun clearForegroundMiniSuppression(taskId: Int) {
+        if (taskId > 0 && suppressForegroundMiniTasks.remove(taskId)) {
+            persistSuppressedForegroundMiniTasks()
+        }
+    }
+
+    private fun cancelFullscreenTransitionAnim(taskId: Int) {
+        fullscreenAnimRunnables.remove(taskId)?.let {
+            mainHandler.removeCallbacks(it.runnable)
+        }
+    }
+
+    /**
+     * Animate the leash after WM has committed fullscreen. The leash now contains the fullscreen
+     * buffer, so the first frame is an aspect-preserving cover of the old card rather than a
+     * non-uniform stretch of the old freeform buffer.
+     */
+    private fun animateFullscreenLeash(
+        taskId: Int,
+        from: Rect,
+        fullscreen: Rect,
+        fromRadius: Float,
+    ) {
+        cancelFullscreenTransitionAnim(taskId)
+        val startMs = System.currentTimeMillis()
+        val duration = FreeformPolicy.MAXIMIZE_ANIM_MS.coerceAtLeast(1L)
+        val tick = object : Runnable {
+            override fun run() {
+                fullscreenAnimRunnables.remove(taskId)
+                if (SystemServices.taskWindowingMode(taskId) !=
+                    FreeformPolicy.WINDOWING_MODE_FULLSCREEN
+                ) return
+                val p = ((System.currentTimeMillis() - startMs).toFloat() / duration)
+                    .coerceIn(0f, 1f)
+                val posP = FreeformPolicy.folmeSpring(
+                    p,
+                    FreeformPolicy.SPRING_MAXIMIZE_POS_DAMPING,
+                    FreeformPolicy.SPRING_MAXIMIZE_POS_RESPONSE,
+                )
+                val sizeP = FreeformPolicy.folmeSpring(
+                    p,
+                    FreeformPolicy.SPRING_MAXIMIZE_SIZE_DAMPING,
+                    FreeformPolicy.SPRING_MAXIMIZE_SIZE_RESPONSE,
+                )
+                val frame = FreeformPolicy.maximizeFullscreenFrame(from, fullscreen, posP, sizeP)
+                SystemServices.applyFullscreenTransitionVisual(
+                    taskId,
+                    frame,
+                    fromRadius,
+                    0f,
+                    sizeP,
+                )
+                if (p < 1f) {
+                    fullscreenAnimRunnables[taskId] = TransitionAnimSession(this) {}
+                    mainHandler.postDelayed(this, 16L)
+                } else {
+                    SystemServices.resetTaskLeashForFullscreen(taskId)
+                }
+            }
+        }
+        val first = FreeformPolicy.maximizeFullscreenFrame(from, fullscreen, 0f, 0f)
+        SystemServices.applyFullscreenTransitionVisual(taskId, first, fromRadius, 0f, 0f)
+        fullscreenAnimRunnables[taskId] = TransitionAnimSession(tick) {}
+        mainHandler.postDelayed(tick, 16L)
     }
 
     /**
@@ -505,6 +600,7 @@ object FreeformManagerService : IFreeformManager.Stub() {
     }
 
     fun onTaskRemoved(taskId: Int) {
+        clearForegroundMiniSuppression(taskId)
         cancelPendingPinFinish(taskId)
         cancelPendingLandscapeRestore(taskId)
         cancelVisualSettleGuard(taskId)
@@ -558,7 +654,7 @@ object FreeformManagerService : IFreeformManager.Stub() {
      * ActivityStarter hook entry for an ordinary (non-freeform-options) external launch.
      * If its package already owns a managed small-window Task, convert that same Task back to
      * fullscreen synchronously before ActivityStarter chooses/reuses it. Launches originating from
-     * inside the same freeform Task are normal in-app navigation and must remain freeform.
+     * a managed freeform Task (including cross-package system helpers) must remain freeform.
      */
     fun promoteTrackedFreeformForNormalLaunch(packageName: String, sourceTaskId: Int?): Int? {
         val state = tasks.values.firstOrNull {
@@ -1136,6 +1232,27 @@ object FreeformManagerService : IFreeformManager.Stub() {
         tasks.values.any { WindowState.isVisibleFreeform(it.windowState) }
 
     /**
+     * Focused freeform windows must not drive status/navigation bar appearance. Otherwise opening
+     * a small window over an immersive fullscreen app shows white system bars.
+     */
+    fun shouldIgnoreSystemUiFlags(taskId: Int): Boolean {
+        val s = tasks[taskId] ?: return false
+        return WindowState.isVisibleFreeform(s.windowState) || s.pinAnimating
+    }
+
+    /**
+     * Safety net: an ordinary start inherited WINDOWING_MODE_FREEFORM from the focused small
+     * window. Convert that untracked task back to fullscreen before it starts flickering.
+     */
+    fun revertUnsolicitedFreeformLaunch(taskId: Int, packageName: String) {
+        if (taskId <= 0 || tasks.containsKey(taskId)) return
+        if (isPendingFreeformLaunch(packageName)) return
+        XLog.i("revert unsolicited freeform task=$taskId pkg=$packageName")
+        SystemServices.resetTaskLeashForFullscreen(taskId)
+        SystemServices.exitTaskToFullscreen(taskId)
+    }
+
+    /**
      * True during the first-layout gap before a pending module launch is added to [tasks], or for
      * an already tracked task. Used by the Task hook so the launch Activity never receives an
      * independently minimum-expanded configuration.
@@ -1186,6 +1303,7 @@ object FreeformManagerService : IFreeformManager.Stub() {
     fun freeformBoundsOf(taskId: Int): Rect? {
         val s = tasks[taskId] ?: return null
         if (!WindowState.isVisibleFreeform(s.windowState)) return null
+        pendingOrientationTransitions[taskId]?.let { return Rect(it.sourceBounds) }
         return if (!s.landscapeTaskBounds.isEmpty) {
             Rect(s.landscapeTaskBounds)
         } else {
@@ -1367,6 +1485,21 @@ object FreeformManagerService : IFreeformManager.Stub() {
     /** Portrait normal bounds remembered before an app-requested landscape rotation. */
     private val preLandscapeBounds = ConcurrentHashMap<Int, Rect>()
 
+    /**
+     * Canonical geometry published synchronously when an app requests orientation, before WM starts
+     * resolving that request. Configuration hooks read this so no stale portrait/landscape frame is
+     * delivered while the actual task resize is waiting on the system-server main thread.
+     */
+    private data class PendingOrientationTransition(
+        val orientation: Int,
+        val landscape: Boolean,
+        val visualBounds: Rect,
+        val sourceBounds: Rect,
+    )
+    private val pendingOrientationTransitions =
+        ConcurrentHashMap<Int, PendingOrientationTransition>()
+    private val pendingOrientationApplies = ConcurrentHashMap<Int, Runnable>()
+
     /** Pending restore for an ambiguous orientation emitted during a player surface rebuild. */
     private val pendingLandscapeRestores = ConcurrentHashMap<Int, Runnable>()
 
@@ -1403,58 +1536,117 @@ object FreeformManagerService : IFreeformManager.Stub() {
      * being refused as split-screen). Requesting portrait again restores the prior bounds.
      */
     fun onAppRequestedOrientation(taskId: Int, orientation: Int) {
-        mainHandler.post {
-            val state = tasks[taskId] ?: return@post
-            // Only NORMAL freeform rotates; mini/pin keep their geometry.
-            if (state.windowState != WindowState.NORMAL) return@post
-            val wantLandscape = FreeformPolicy.isLandscapeOrientation(orientation)
-            val appLandscape = !state.landscapeTaskBounds.isEmpty
-            if (wantLandscape && !appLandscape) {
+        val state = tasks[taskId] ?: return
+        if (state.windowState != WindowState.NORMAL) return
+        val wantLandscape = FreeformPolicy.isLandscapeOrientation(orientation)
+        val wantPortrait = FreeformPolicy.isPortraitOrientation(orientation)
+        val pending = pendingOrientationTransitions[taskId]
+        val appLandscape = !state.landscapeTaskBounds.isEmpty || pending?.landscape == true
+
+        val transition = when {
+            wantLandscape -> {
                 cancelPendingLandscapeRestore(taskId)
-                // Remember the pre-landscape VISUAL bounds for restore.
-                preLandscapeBounds[taskId] = Rect(state.bounds)
-                // 16:9 VISIBLE window (from the unscaled base, so a scaled 小窗 still gets a full one).
-                val vis = FreeformPolicy.landscapeBoundsFor(miniSourceBounds(state))
-                // Render the app at a FULL LANDSCAPE DISPLAY size (the display, rotated) so it enters
-                // its REAL landscape-fullscreen player UI — not the half-screen "video + 简介/评论"
-                // player. Then SCALE the whole leash down into the small 16:9 window (Xiaomi does the
-                // same: the app believes it is fullscreen-landscape; the window is a scaled preview).
-                val (dw, dh) = FreeformPolicy.displaySize()
-                val sw = maxOf(dw, dh)
-                val sh = minOf(dw, dh)
-                // Keep the render task on-screen when the physical display is already landscape.
-                // The leash is positioned at `vis`; tying the task's own origin to `vis` would put
-                // its right/bottom outside the display and WM would silently clamp it to another
-                // aspect ratio before we apply the mask.
-                val source = Rect(0, 0, sw, sh)
-                state.landscape = true
-                state.bounds = Rect(vis)
-                state.restoreNormalBounds = Rect(vis)
-                state.landscapeTaskBounds = Rect(source)
-                stopLiveResizeVisual(taskId)
-                // Commit, then read back WM's authoritative source before scaling/cropping.
-                applyNormalGeometry(taskId, state)
-                shell?.onStateChanged(state.snapshot())
-                XLog.i("app landscape fullscreen task=$taskId source=$source vis=$vis")
-            } else if (wantLandscape) {
-                cancelPendingLandscapeRestore(taskId)
-            } else if (appLandscape && FreeformPolicy.isPortraitOrientation(orientation)) {
-                cancelPendingLandscapeRestore(taskId)
-                val restore = preLandscapeBounds.remove(taskId)
-                    ?: FreeformPolicy.defaultNormalBounds()
-                state.landscape = false
-                state.bounds = Rect(restore)
-                state.restoreNormalBounds = Rect(restore)
-                state.landscapeTaskBounds = Rect()
-                stopLiveResizeVisual(taskId)
-                resizeTaskInternal(taskId, restore)
-                SystemServices.clearLiveResizeVisual(taskId, restore)
-                SystemServices.applyFreeformSurfaceStyle(taskId, restore, false)
-                shell?.onStateChanged(state.snapshot())
-                XLog.i("app portrait freeform task=$taskId -> $restore (orientation=$orientation)")
-            } else if (appLandscape) {
-                scheduleLandscapeRestore(taskId, orientation)
+                val portrait = Rect(
+                    preLandscapeBounds[taskId]
+                        ?: pending?.takeIf { !it.landscape }?.visualBounds
+                        ?: state.bounds,
+                )
+                preLandscapeBounds.putIfAbsent(taskId, Rect(portrait))
+                val visual = FreeformPolicy.landscapeBoundsFor(portrait)
+                PendingOrientationTransition(
+                    orientation = orientation,
+                    landscape = true,
+                    visualBounds = Rect(visual),
+                    sourceBounds = FreeformPolicy.landscapeSourceBoundsFor(portrait),
+                )
             }
+            wantPortrait && appLandscape -> {
+                cancelPendingLandscapeRestore(taskId)
+                val restore = Rect(
+                    preLandscapeBounds[taskId]
+                        ?: pending?.takeIf { !it.landscape }?.visualBounds
+                        ?: FreeformPolicy.defaultNormalBounds(),
+                )
+                PendingOrientationTransition(
+                    orientation = orientation,
+                    landscape = false,
+                    visualBounds = Rect(restore),
+                    sourceBounds = Rect(restore),
+                )
+            }
+            else -> {
+                if (appLandscape) scheduleLandscapeRestore(taskId, orientation)
+                return
+            }
+        }
+
+        // Publish before ActivityRecord resolves the request. Repeated controller/ActivityRecord
+        // hooks simply replace the plan; one main-thread runnable commits only the latest request.
+        pendingOrientationTransitions[taskId] = transition
+        val action = Runnable {
+            val currentAction = pendingOrientationApplies.remove(taskId)
+            if (currentAction == null) return@Runnable
+            val planned = pendingOrientationTransitions[taskId] ?: return@Runnable
+            val current = tasks[taskId] ?: run {
+                pendingOrientationTransitions.remove(taskId, planned)
+                return@Runnable
+            }
+            if (current.windowState != WindowState.NORMAL) {
+                pendingOrientationTransitions.remove(taskId, planned)
+                return@Runnable
+            }
+
+            if (planned.landscape) {
+                val prevVisual = Rect(current.bounds)
+                current.landscape = true
+                current.bounds = Rect(planned.visualBounds)
+                // Preserve restoreNormalBounds: it is the configured portrait window, not the
+                // temporary landscape card.
+                current.landscapeTaskBounds = Rect(planned.sourceBounds)
+                stopLiveResizeVisual(taskId)
+                applyNormalGeometry(taskId, current)
+                SystemServices.applyFreeformDensity(
+                    taskId,
+                    freeformDpiOf(taskId),
+                    current.landscapeTaskBounds,
+                )
+                // Density dispatch triggers another surface placement; finish with the canonical
+                // crop/scale/radius and its settle guard so corners survive the config change.
+                applyNormalGeometry(taskId, current)
+                // MIUI orientation sweep: ROTATE_POSITION_Z_EASE spring(0.95, 0.42) leash
+                // transition from the portrait card to the landscape card (visual only;
+                // the task config already committed above).
+                animateOrientationTransition(taskId, current, prevVisual)
+                shell?.onStateChanged(current.snapshot())
+                XLog.i(
+                    "app landscape fullscreen task=$taskId source=${current.landscapeTaskBounds} " +
+                        "vis=${current.bounds} dpi=${freeformDpiOf(taskId)}",
+                )
+            } else {
+                val prevVisual = Rect(current.bounds)
+                val restore = Rect(planned.visualBounds)
+                preLandscapeBounds.remove(taskId)
+                current.landscape = false
+                current.bounds = Rect(restore)
+                current.restoreNormalBounds = Rect(restore)
+                current.landscapeTaskBounds = Rect()
+                stopLiveResizeVisual(taskId)
+                applyNormalGeometry(taskId, current)
+                SystemServices.applyFreeformDensity(taskId, freeformDpiOf(taskId), restore)
+                // Re-assert after density/config dispatch; identity-size windows need the same
+                // late corner-radius guard as scaled landscape windows.
+                applyNormalGeometry(taskId, current)
+                animateOrientationTransition(taskId, current, prevVisual)
+                shell?.onStateChanged(current.snapshot())
+                XLog.i(
+                    "app portrait freeform task=$taskId -> $restore " +
+                        "(orientation=${planned.orientation} dpi=${freeformDpiOf(taskId)})",
+                )
+            }
+            pendingOrientationTransitions.remove(taskId, planned)
+        }
+        if (pendingOrientationApplies.putIfAbsent(taskId, action) == null) {
+            mainHandler.post(action)
         }
     }
 
@@ -1646,6 +1838,9 @@ object FreeformManagerService : IFreeformManager.Stub() {
     }
 
     private fun startFreeformFromRecentInternal(taskId: Int, desiredState: Int) {
+        // Explicit Recents hot-zone conversion is an intentional opt-in; it may clear the
+        // navigation tombstone left by a previous freeform maximize for this task.
+        clearForegroundMiniSuppression(taskId)
         if (!enabled) {
             XLog.e("Freeform disabled")
             return
@@ -2218,11 +2413,64 @@ object FreeformManagerService : IFreeformManager.Stub() {
         // freeform configuration. Writing the task override here, after the launch activity has
         // resumed, forces a density relaunch; apps with duplicate-launch guards (for example TIM)
         // then close both launch activities. Keep post-launch task configuration unchanged.
-        // Geometry is already committed above.  Do not run a second leash animation here:
-        // WM may place the first app surface between those transactions, which used to make
-        // the window visibly zoom from 0.86x to 1x while it opened.
-        finishOpenWithoutScale(taskId, component.packageName)
+        animateOpenLaunch(taskId, component.packageName)
         waitForLaunchWindowDrawn(taskId, component.packageName)
+    }
+
+    /**
+     * MIUI enter-freeform open animation (TO_FREEFORM_POSITION_SIZE_EASE = spring(0.95, 0.4)):
+     * the window grows from 0.86x and fades in (openVisualFrame), with the opaque launch splash
+     * tracking the same frames. The old one-shot leash animation visibly restarted when WM
+     * placed the first app surface mid-flight (zoom glitch); this 16ms self-healing tick
+     * re-asserts the current frame instead, so an external reset heals within one frame.
+     */
+    private fun animateOpenLaunch(taskId: Int, packageName: String) {
+        val state = tasks[taskId]
+        if (state == null || !WindowState.isVisibleFreeform(state.windowState)) {
+            finishOpenWithoutScale(taskId, packageName)
+            return
+        }
+        val mini = state.windowState == WindowState.MINI
+        val bounds = Rect(state.bounds)
+        val source = if (mini) miniSourceBounds(state) else normalTaskSourceBounds(state)
+        val startFrame = FreeformPolicy.openVisualFrame(bounds, 0f)
+        val from = Rect(
+            startFrame.left.toInt(),
+            startFrame.top.toInt(),
+            (startFrame.left + startFrame.width).toInt(),
+            (startFrame.top + startFrame.height).toInt(),
+        )
+        val radius = FreeformPolicy.freeformVisibleCornerRadiusPx(
+            mini, bounds.width(), bounds.height(),
+        )
+        // applyNormalGeometry arms a final-state settle guard. During the enter animation that
+        // guard would reassert the full-size frame every 16ms and fight the opening sweep.
+        cancelVisualSettleGuard(taskId)
+        animateTaskVisualTransition(
+            taskId = taskId,
+            source = source,
+            from = from,
+            to = bounds,
+            durationMs = FreeformPolicy.OPEN_ANIM_MS,
+            posDamping = FreeformPolicy.SPRING_TO_FREEFORM_DAMPING,
+            posResponse = FreeformPolicy.SPRING_TO_FREEFORM_RESPONSE,
+            sizeDamping = FreeformPolicy.SPRING_TO_FREEFORM_DAMPING,
+            sizeResponse = FreeformPolicy.SPRING_TO_FREEFORM_RESPONSE,
+            fromAlpha = startFrame.alpha,
+            toAlpha = 1f,
+            fromRadius = radius,
+            toRadius = radius,
+            guard = { WindowState.isVisibleFreeform(it.windowState) },
+            frameHook = { frame -> shell?.onLaunchAnimFrame(packageName, frame) },
+            onCancel = {
+                // A close/pin/maximize/split can supersede the 300ms enter animation. The launch
+                // mask only needs to wait for first content now; keeping this false would hold
+                // the splash until its 8s timeout.
+                launchAnimationDone[packageName] = true
+            },
+        ) {
+            finishOpenWithoutScale(taskId, packageName)
+        }
     }
 
     private fun finishOpenWithoutScale(taskId: Int, packageName: String) {
@@ -2263,6 +2511,22 @@ object FreeformManagerService : IFreeformManager.Stub() {
                 if ((drawn && animationDone) || timedOut || !tasks.containsKey(taskId)) {
                     pendingLaunchSplashChecks.remove(packageName, this)
                     launchAnimationDone.remove(packageName)
+                    // The app's first BLAST/SurfaceView buffer can make WM run one last surface
+                    // placement after the launch transaction, clearing Task cornerRadius while
+                    // leaving our numeric radius calculation intact. Re-assert the complete
+                    // crop/radius geometry only after the real main window is drawn, then let the
+                    // settle guard cover the remaining placement frames.
+                    tasks[taskId]?.let { current ->
+                        if (current.windowState == WindowState.NORMAL) {
+                            applyNormalGeometry(taskId, current)
+                        } else if (current.windowState == WindowState.MINI) {
+                            SystemServices.applyMiniFreeformVisual(
+                                taskId,
+                                miniSourceBounds(current),
+                                current.bounds,
+                            )
+                        }
+                    }
                     shell?.dismissLaunchSplash(packageName)
                     XLog.d(
                         "launch splash settle task=$taskId pkg=$packageName " +
@@ -2526,8 +2790,7 @@ object FreeformManagerService : IFreeformManager.Stub() {
      */
     private fun startVisualSettleGuard(taskId: Int, sourceBounds: Rect, visualBounds: Rect) {
         cancelVisualSettleGuard(taskId)
-        if (sourceBounds == visualBounds ||
-            sourceBounds.width() <= 0 || sourceBounds.height() <= 0 ||
+        if (sourceBounds.width() <= 0 || sourceBounds.height() <= 0 ||
             visualBounds.width() <= 0 || visualBounds.height() <= 0
         ) return
 
@@ -2546,14 +2809,16 @@ object FreeformManagerService : IFreeformManager.Stub() {
                     return
                 }
 
-                // WM may clamp or finish applying the source bounds between frames.  Scale from
-                // the current authoritative task rect so content can never outrun the mask.
+                // WM may clamp or finish applying the source bounds between frames. This also runs
+                // for identity-size windows: their matrix is stable, but a late app/SurfaceView
+                // buffer can still reset the Task crop's corner radius to zero.
                 val currentSource = SystemServices.taskBounds(taskId) ?: expectedSource
                 SystemServices.applyMiniFreeformVisual(
                     taskId,
                     currentSource,
                     expectedVisual,
                     miniStyle = false,
+                    logResult = false,
                 )
                 if (android.os.SystemClock.uptimeMillis() - started < 700L) {
                     mainHandler.postDelayed(this, 16L)
@@ -2681,6 +2946,7 @@ object FreeformManagerService : IFreeformManager.Stub() {
             XLog.e("closeTask invalid taskId=$taskId")
             return
         }
+        cancelTransitionAnim(taskId)
         if (fromAnimation) {
             // The custom shrink+fade close animation already left the leash faded to alpha 0.
             // Do NOT clearFreeformSurfaceStyle / showTaskFromPin here — those reset the leash to
@@ -2794,7 +3060,44 @@ object FreeformManagerService : IFreeformManager.Stub() {
      */
     private fun fullscreenTaskInternal(taskId: Int) {
         val tracked = tasks[taskId]
+        if (tracked != null &&
+            (WindowState.isVisibleFreeform(tracked.windowState) ||
+                WindowState.isPinned(tracked.windowState))
+        ) {
+            // The next bottom swipe belongs to the stock launcher navigation path. Without this
+            // tombstone HookLauncher mistakes the just-maximized task for a normal foreground app
+            // and converts it straight back to MINI instead of showing HOME/Recents.
+            suppressForegroundMiniForTask(taskId)
+        }
+        if (tracked != null && WindowState.isVisibleFreeform(tracked.windowState) &&
+            !tracked.pinAnimating
+        ) {
+            // Commit WM fullscreen first. The post-commit leash animation then operates on the
+            // fullscreen buffer, avoiding the visibly stretched old freeform buffer.
+            val from = Rect(tracked.bounds)
+            val (dw, dh) = FreeformPolicy.displaySize()
+            val full = Rect(0, 0, dw, dh)
+            val fromRadius = FreeformPolicy.freeformVisibleCornerRadiusPx(
+                tracked.windowState == WindowState.MINI,
+                from.width(),
+                from.height(),
+            )
+            cancelVisualSettleGuard(taskId)
+            stopLiveResizeVisual(taskId)
+            // Chrome does not ride along on a maximize; MIUI drops the caption up front.
+            shell?.onTaskRemoved(taskId)
+            performFullscreenExit(taskId)
+            animateFullscreenLeash(taskId, from, full, fromRadius)
+            return
+        }
+        performFullscreenExit(taskId)
+    }
+
+    private fun performFullscreenExit(taskId: Int) {
+        val tracked = tasks[taskId]
         try {
+            cancelFullscreenTransitionAnim(taskId)
+            cancelTransitionAnim(taskId)
             cancelVisualSettleGuard(taskId)
             stopLiveResizeVisual(taskId)
             // If pinned, unhide first so fullscreen surface is visible.
@@ -2806,6 +3109,9 @@ object FreeformManagerService : IFreeformManager.Stub() {
             val exited = SystemServices.exitTaskToFullscreen(taskId)
             // Binder/ATM fallback still useful on some builds.
             setTaskWindowingMode(taskId, FreeformPolicy.WINDOWING_MODE_FULLSCREEN)
+            // Final density safety net: the ATM mode switch may have re-resolved the task with
+            // the stale freeform density. No-op when already cleared.
+            SystemServices.clearTaskDensityOverride(taskId)
             runCatching {
                 SystemServices.activityManager.moveTaskToFront(taskId, 0)
             }
@@ -2834,7 +3140,50 @@ object FreeformManagerService : IFreeformManager.Stub() {
     private fun splitTaskInternal(taskId: Int, position: Int) {
         val pos = if (position == FreeformPolicy.SPLIT_POSITION_BOTTOM_OR_RIGHT) 1 else 0
         val tracked = tasks[taskId]
+        if (tracked != null && WindowState.isVisibleFreeform(tracked.windowState) &&
+            !tracked.pinAnimating
+        ) {
+            // MIUI freeform→split: TO_FULLSCREEN_SPLIT position spring(0.85, 0.55) /
+            // size spring(0.9, 0.48) sweep into the stage half, then the stage handoff runs.
+            val from = Rect(tracked.bounds)
+            val source = if (tracked.windowState == WindowState.MINI) {
+                miniSourceBounds(tracked)
+            } else {
+                normalTaskSourceBounds(tracked)
+            }
+            val half = FreeformPolicy.splitHalfBounds(pos)
+            val fromRadius = FreeformPolicy.freeformVisibleCornerRadiusPx(
+                tracked.windowState == WindowState.MINI,
+                from.width(),
+                from.height(),
+            )
+            cancelVisualSettleGuard(taskId)
+            stopLiveResizeVisual(taskId)
+            shell?.onTaskRemoved(taskId)
+            animateTaskVisualTransition(
+                taskId = taskId,
+                source = source,
+                from = from,
+                to = half,
+                durationMs = FreeformPolicy.SPLIT_ANIM_MS,
+                posDamping = FreeformPolicy.SPRING_SPLIT_POS_DAMPING,
+                posResponse = FreeformPolicy.SPRING_SPLIT_POS_RESPONSE,
+                sizeDamping = FreeformPolicy.SPRING_SPLIT_SIZE_DAMPING,
+                sizeResponse = FreeformPolicy.SPRING_SPLIT_SIZE_RESPONSE,
+                fromRadius = fromRadius,
+                toRadius = 0f,
+            ) {
+                performSplitExit(taskId, pos)
+            }
+            return
+        }
+        performSplitExit(taskId, pos)
+    }
+
+    private fun performSplitExit(taskId: Int, pos: Int) {
+        val tracked = tasks[taskId]
         try {
+            cancelTransitionAnim(taskId)
             if (tracked != null && WindowState.isPinned(tracked.windowState)) {
                 SystemServices.showTaskFromPin(taskId)
             }
@@ -2917,17 +3266,38 @@ object FreeformManagerService : IFreeformManager.Stub() {
                     nearRight = FreeformPolicy.pinEdge(state.bounds) == 1
                 )
                 miniBounds = FreeformPolicy.adjustBoundsForSidebarIfNeed(miniBounds)
+                val fromBounds = Rect(state.bounds)
                 state.restoreNormalBounds = Rect(state.bounds)
                 state.bounds = miniBounds
                 state.windowState = WindowState.MINI
                 state.restoreMiniBounds = Rect(miniBounds)
+                val source = Rect(state.restoreNormalBounds)
                 // Keep normal Task configuration and scale its leash into mini bounds.
                 resizeTaskInternal(taskId, state.restoreNormalBounds)
-                SystemServices.applyMiniFreeformVisual(
-                    taskId,
-                    state.restoreNormalBounds,
-                    miniBounds,
+                // MIUI applyFreeformToMiniAnimation: DEFAULT_EASE spring(0.95, 0.35) shrink
+                // sweep on the leash; real bounds stay at the normal source the whole time.
+                val fromRadius = FreeformPolicy.freeformVisibleCornerRadiusPx(
+                    false, fromBounds.width(), fromBounds.height(),
                 )
+                val toRadius = FreeformPolicy.freeformVisibleCornerRadiusPx(
+                    true, miniBounds.width(), miniBounds.height(),
+                )
+                animateTaskVisualTransition(
+                    taskId = taskId,
+                    source = source,
+                    from = fromBounds,
+                    to = miniBounds,
+                    durationMs = FreeformPolicy.MINI_ENTER_ANIM_MS,
+                    posDamping = FreeformPolicy.SPRING_DEFAULT_DAMPING,
+                    posResponse = FreeformPolicy.SPRING_DEFAULT_RESPONSE,
+                    sizeDamping = FreeformPolicy.SPRING_DEFAULT_DAMPING,
+                    sizeResponse = FreeformPolicy.SPRING_DEFAULT_RESPONSE,
+                    fromRadius = fromRadius,
+                    toRadius = toRadius,
+                    guard = { it.windowState == WindowState.MINI },
+                ) {
+                    SystemServices.applyMiniFreeformVisual(taskId, source, miniBounds)
+                }
                 shell?.onStateChanged(state.snapshot())
             } else if (!mini && state.windowState == WindowState.MINI) {
                 val normal = if (state.restoreNormalBounds.width() > 0) {
@@ -2949,6 +3319,7 @@ object FreeformManagerService : IFreeformManager.Stub() {
      * [toBounds] (a slight overshoot from the spring), then commit real bounds + clear transform.
      */
     private fun animateExpandFromMini(taskId: Int, source: Rect, fromBounds: Rect, toBounds: Rect) {
+        cancelTransitionAnim(taskId)
         val startMs = System.currentTimeMillis()
         val duration = FreeformPolicy.EXPAND_ANIM_MS.coerceAtLeast(1L)
         val tick = object : Runnable {
@@ -2981,6 +3352,132 @@ object FreeformManagerService : IFreeformManager.Stub() {
         mainHandler.postDelayed(tick, 16L)
     }
 
+    private class TransitionAnimSession(
+        val runnable: Runnable,
+        val onCancel: () -> Unit,
+    )
+
+    /** Running generic transition animations (open/mini/maximize/split/rotate/unpin), per task. */
+    private val transitionAnimRunnables = ConcurrentHashMap<Int, TransitionAnimSession>()
+
+    private fun cancelTransitionAnim(taskId: Int) {
+        transitionAnimRunnables.remove(taskId)?.let { session ->
+            mainHandler.removeCallbacks(session.runnable)
+            session.onCancel()
+        }
+    }
+
+    fun isTransitionAnimating(taskId: Int): Boolean = transitionAnimRunnables.containsKey(taskId)
+
+    /**
+     * MIUI orientation-change sweep (ROTATE_POSITION_Z_EASE = spring(0.95, 0.42)): the leash
+     * flies from the previous visual rect to the committed one. The real task geometry has
+     * already been applied by the caller; this only smooths the visual switch, then re-asserts
+     * the canonical geometry (and its settle guard) at the end.
+     */
+    private fun animateOrientationTransition(
+        taskId: Int,
+        state: FreeformTaskState,
+        prevVisual: Rect,
+    ) {
+        if (prevVisual.isEmpty || prevVisual == state.bounds) return
+        val source = if (state.landscapeTaskBounds.width() > 0 &&
+            state.landscapeTaskBounds.height() > 0
+        ) {
+            Rect(state.landscapeTaskBounds)
+        } else {
+            normalTaskSourceBounds(state)
+        }
+        val target = Rect(state.bounds)
+        val radius = FreeformPolicy.freeformVisibleCornerRadiusPx(
+            false, target.width(), target.height(),
+        )
+        // The settle guard started by applyNormalGeometry would fight the sweep; the final
+        // re-assert below starts a fresh one.
+        cancelVisualSettleGuard(taskId)
+        animateTaskVisualTransition(
+            taskId = taskId,
+            source = source,
+            from = prevVisual,
+            to = target,
+            durationMs = FreeformPolicy.ROTATE_ANIM_MS,
+            posDamping = FreeformPolicy.SPRING_ROTATE_DAMPING,
+            posResponse = FreeformPolicy.SPRING_ROTATE_RESPONSE,
+            sizeDamping = FreeformPolicy.SPRING_ROTATE_DAMPING,
+            sizeResponse = FreeformPolicy.SPRING_ROTATE_RESPONSE,
+            fromRadius = radius,
+            toRadius = radius,
+            guard = { it.windowState == WindowState.NORMAL },
+        ) {
+            tasks[taskId]?.let { applyNormalGeometry(taskId, it) }
+        }
+    }
+
+    /**
+     * MIUI-style leash transition: dual Folme springs (position/size), lerped corner radius and
+     * alpha, visual-only until [onEnd] commits the real geometry. Used for the transitions MIUI
+     * animates: normal→mini, unpin restore, maximize, split and orientation change.
+     */
+    private fun animateTaskVisualTransition(
+        taskId: Int,
+        source: Rect,
+        from: Rect,
+        to: Rect,
+        durationMs: Long,
+        posDamping: Float,
+        posResponse: Float,
+        sizeDamping: Float,
+        sizeResponse: Float,
+        fromAlpha: Float = 1f,
+        toAlpha: Float = 1f,
+        fromRadius: Float,
+        toRadius: Float,
+        guard: (FreeformTaskState) -> Boolean = { true },
+        frameHook: (FreeformPolicy.WindowVisualFrame) -> Unit = {},
+        onCancel: () -> Unit = {},
+        onEnd: () -> Unit,
+    ) {
+        cancelTransitionAnim(taskId)
+        val startMs = System.currentTimeMillis()
+        val duration = durationMs.coerceAtLeast(1L)
+        val tick = object : Runnable {
+            override fun run() {
+                transitionAnimRunnables.remove(taskId)
+                val state = tasks[taskId]
+                if (state == null || !guard(state)) {
+                    onCancel()
+                    return
+                }
+                val elapsed = System.currentTimeMillis() - startMs
+                val p = (elapsed.toFloat() / duration).coerceIn(0f, 1f)
+                val posP = FreeformPolicy.folmeSpring(p, posDamping, posResponse)
+                val sizeP = FreeformPolicy.folmeSpring(p, sizeDamping, sizeResponse)
+                val frame = FreeformPolicy.transitionVisualFrame(
+                    from, to, posP, sizeP, fromAlpha, toAlpha,
+                )
+                SystemServices.applyTransitionVisual(
+                    taskId, source, frame, fromRadius, toRadius, sizeP,
+                )
+                shell?.onWindowAnimFrame(taskId, frame)
+                frameHook(frame)
+                if (p < 1f) {
+                    transitionAnimRunnables[taskId] = TransitionAnimSession(this, onCancel)
+                    mainHandler.postDelayed(this, 16L)
+                } else {
+                    onEnd()
+                }
+            }
+        }
+        // Apply the first frame synchronously so the transition starts within the same
+        // main-thread message as the state change (no final-state flash in between).
+        val first = FreeformPolicy.transitionVisualFrame(from, to, 0f, 0f, fromAlpha, toAlpha)
+        SystemServices.applyTransitionVisual(taskId, source, first, fromRadius, toRadius, 0f)
+        shell?.onWindowAnimFrame(taskId, first)
+        frameHook(first)
+        transitionAnimRunnables[taskId] = TransitionAnimSession(tick, onCancel)
+        mainHandler.postDelayed(tick, 16L)
+    }
+
     override fun pinTask(taskId: Int, pin: Boolean) {
         if (pin) mainHandler.post { pinTaskInternal(taskId) }
         else mainHandler.post { unpinTask(taskId) }
@@ -2988,6 +3485,7 @@ object FreeformManagerService : IFreeformManager.Stub() {
 
     private fun pinTaskInternal(taskId: Int) {
         val state = tasks[taskId] ?: return
+        cancelTransitionAnim(taskId)
         stopLiveResizeVisual(taskId)
         // Already fully pinned (bubble phase): ignore.
         if (WindowState.isPinned(state.windowState) && !state.pinAnimating) return
@@ -3056,14 +3554,20 @@ object FreeformManagerService : IFreeformManager.Stub() {
                 if (!cur.pinAnimating) return
                 val elapsed = System.currentTimeMillis() - startMs
                 val p = (elapsed.toFloat() / duration).coerceIn(0f, 1f)
-                // Xiaomi Folme spring settle (PRE_CHANGE_DRAG_EASE = spring(0.9, 0.35)).
-                val eased = FreeformPolicy.folmeSpring(
+                // MIUI pin eases: PIN_POSITION_EASE = spring(0.78, 0.6) for the edge flight,
+                // PIN_WIDTH_HEIGHT_EASE = spring(1.0, 0.35) for the shrink itself.
+                val posP = FreeformPolicy.folmeSpring(
                     p,
-                    FreeformPolicy.SPRING_PIN_DAMPING,
-                    FreeformPolicy.SPRING_PIN_RESPONSE,
+                    FreeformPolicy.SPRING_PIN_POS_DAMPING,
+                    FreeformPolicy.SPRING_PIN_POS_RESPONSE,
                 )
-                val frame = FreeformPolicy.pinVisualFrame(source, bounds, pinPos, eased)
-                SystemServices.applyPinShrinkVisual(taskId, source, frame, eased)
+                val sizeP = FreeformPolicy.folmeSpring(
+                    p,
+                    FreeformPolicy.SPRING_PIN_SIZE_DAMPING,
+                    FreeformPolicy.SPRING_PIN_SIZE_RESPONSE,
+                )
+                val frame = FreeformPolicy.pinVisualFrame(source, bounds, pinPos, posP, sizeP)
+                SystemServices.applyPinShrinkVisual(taskId, source, frame, sizeP)
                 shell?.onWindowAnimFrame(taskId, frame)
                 if (p < 1f && cur.pinAnimating) {
                     pendingPinVisual[taskId] = this
@@ -3212,17 +3716,55 @@ object FreeformManagerService : IFreeformManager.Stub() {
         state.alwaysOnTop = true
         // Reverse Xiaomi pin hide; do not startActivity (page state keep).
         SystemServices.showTaskFromPin(taskId)
-        // Clear any leftover freeform→pin shrink matrix from finish path.
-        if (restoreState == WindowState.MINI) {
-            val source = miniSourceBounds(state)
-            SystemServices.resetPinShrinkVisual(taskId, source)
-            hardenFreeformTask(taskId, source)
-            SystemServices.applyMiniFreeformVisual(taskId, source, bounds)
+        // MIUI applyUnPinAnimation: the window expands back from the floating-icon edge
+        // position with TO_FREEFORM_POSITION_SIZE_EASE = spring(0.95, 0.4); the real bounds
+        // commit happens once the sweep finishes.
+        val source = if (restoreState == WindowState.MINI) {
+            miniSourceBounds(state)
         } else {
-            SystemServices.resetPinShrinkVisual(taskId, bounds)
-            // Re-assert same freeform bounds (no-op if pin kept them) + surface style.
-            resizeTaskInternal(taskId, bounds)
-            hardenFreeformTask(taskId, bounds)
+            Rect(bounds)
+        }
+        val bubbleFrame = FreeformPolicy.pinVisualFrame(source, bounds, state.pinPos, 1f, 1f)
+        val bubbleRect = Rect(
+            bubbleFrame.left.toInt(),
+            bubbleFrame.top.toInt(),
+            (bubbleFrame.left + bubbleFrame.width).toInt(),
+            (bubbleFrame.top + bubbleFrame.height).toInt(),
+        )
+        val bubbleDensity = SystemServices.systemContext.resources.displayMetrics.density
+        val bubbleRadius = 64f * bubbleDensity * 0.28f
+        val toRadius = FreeformPolicy.freeformVisibleCornerRadiusPx(
+            restoreState == WindowState.MINI,
+            bounds.width(),
+            bounds.height(),
+        )
+        animateTaskVisualTransition(
+            taskId = taskId,
+            source = source,
+            from = bubbleRect,
+            to = Rect(bounds),
+            durationMs = FreeformPolicy.UNPIN_ANIM_MS,
+            posDamping = FreeformPolicy.SPRING_TO_FREEFORM_DAMPING,
+            posResponse = FreeformPolicy.SPRING_TO_FREEFORM_RESPONSE,
+            sizeDamping = FreeformPolicy.SPRING_TO_FREEFORM_DAMPING,
+            sizeResponse = FreeformPolicy.SPRING_TO_FREEFORM_RESPONSE,
+            fromAlpha = bubbleFrame.alpha,
+            toAlpha = 1f,
+            fromRadius = bubbleRadius,
+            toRadius = toRadius,
+            guard = { !WindowState.isPinned(it.windowState) && !it.pinAnimating },
+        ) {
+            // Clear any leftover freeform→pin shrink matrix from finish path.
+            if (restoreState == WindowState.MINI) {
+                SystemServices.resetPinShrinkVisual(taskId, source)
+                hardenFreeformTask(taskId, source)
+                SystemServices.applyMiniFreeformVisual(taskId, source, bounds)
+            } else {
+                SystemServices.resetPinShrinkVisual(taskId, bounds)
+                // Re-assert same freeform bounds (no-op if pin kept them) + surface style.
+                resizeTaskInternal(taskId, bounds)
+                hardenFreeformTask(taskId, bounds)
+            }
         }
         runCatching {
             SystemServices.activityManager.moveTaskToFront(taskId, 0)
