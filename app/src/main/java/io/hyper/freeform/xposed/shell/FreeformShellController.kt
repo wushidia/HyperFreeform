@@ -265,6 +265,7 @@ class FreeformShellController {
         private val caption = FreeformCaptionView(SystemServices.systemContext)
         private var lp = baseLayoutParams()
         private var attached = false
+        private val bottomInput = BottomCaptionInput(state.taskId) { handleTouch(it) }
         /** SystemUI-style touchable region so freeform content receives app touches. */
         private var touchableInsetsInstalled = false
         private var touchableInsetsListener: Any? = null
@@ -322,10 +323,8 @@ class FreeformShellController {
             // invisible edge handles — same listener as root so corner/bottom hits are reliable
             val br = edgeHandle(Gravity.BOTTOM or Gravity.END)
             val bl = edgeHandle(Gravity.BOTTOM or Gravity.START)
-            val bottom = bottomHandle()
             root.addView(br)
             root.addView(bl)
-            root.addView(bottom)
             applyBounds(state.bounds)
             caption.setMini(state.windowState == WindowState.MINI)
             caption.setTitle(state.packageName.substringAfterLast('.').ifEmpty { state.packageName })
@@ -334,17 +333,17 @@ class FreeformShellController {
             caption.setOnTouchListener(touch)
             br.setOnTouchListener(touch)
             bl.setOnTouchListener(touch)
-            bottom.setOnTouchListener(touch)
             runCatching {
                 wm.addView(root, lp)
                 attached = true
                 installTouchableRegion()
                 root.requestApplyInsets()
+                updateBottomInput()
             }.onFailure { XLog.e("caption attach failed", it) }
         }
 
         /**
-         * Only the center pill / corners / bottom strip are touchable.
+         * Only the center pill and corners consume touches; the bottom strip observes them.
          * Content region falls through to the freeform app — fixes dead touch inside freeform.
          * Pattern: SystemUI DragLayout / WindowDecoration TOUCHABLE_INSETS_REGION.
          */
@@ -438,27 +437,17 @@ class FreeformShellController {
                 region.set(0, 0, w, h)
                 return
             }
-            // Sparse touchable region: ONLY the top pill, the bottom-center 小白条, and the two
-            // bottom resize corners. Everything else falls through to the app so normal taps work.
+            // Only the top pill and resize corners consume input. The bottom-center handle
+            // has a separate SPY window: taps reach the app, vertical drags can be captured.
             // A landscape video player owns its complete bottom edge (play/subtitle/speed/quality),
             // so only the top pill remains touchable while that state is active.
             val pillLeft = ((w - pillTouchWidth) / 2).coerceAtLeast(0)
             val pillRight = (pillLeft + pillTouchWidth).coerceAtMost(w)
             val pillTop = ((captionHeight - pillTouchHeight) / 2).coerceAtLeast(0)
             val pillBottom = (pillTop + pillTouchHeight).coerceAtMost(h)
-            val barLeft = ((w - bottomBarTouchWidth) / 2).coerceAtLeast(0)
-            val barRight = (barLeft + bottomBarTouchWidth).coerceAtMost(w)
             val local = Region()
             local.set(pillLeft, pillTop, pillRight, pillBottom)
             if (!state.landscape) {
-                // Bottom-center 小白条 strip only.
-                local.op(
-                    barLeft,
-                    (h - bottomBarTouchHeight).coerceAtLeast(0),
-                    barRight,
-                    h,
-                    Region.Op.UNION,
-                )
                 // Bottom-left resize corner (at the border).
                 local.op(
                     0,
@@ -488,17 +477,20 @@ class FreeformShellController {
             return v
         }
 
-        private fun bottomHandle(): View {
-            val v = View(SystemServices.systemContext)
-            // Only the center 小白条 strip, not the full width.
-            v.layoutParams = FrameLayout.LayoutParams(
-                bottomBarTouchWidth,
-                bottomBarTouchHeight,
-                Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            )
-            v.isClickable = true
-            v.isFocusable = false
-            return v
+        private fun updateBottomInput() {
+            val eligible = attached && state.windowState == WindowState.NORMAL &&
+                !state.landscape && !state.pinAnimating && !handleMenuAttached &&
+                root.scaleX == 1f && root.scaleY == 1f && root.alpha == 1f
+            if (!eligible) {
+                bottomInput.update(null)
+                return
+            }
+            val width = bottomBarTouchWidth.coerceAtMost(lp.width)
+            val left = lp.x + (lp.width - width) / 2
+            bottomInput.update(Rect(
+                left, lp.y + (lp.height - bottomBarTouchHeight).coerceAtLeast(0),
+                left + width, lp.y + lp.height,
+            ))
         }
 
         fun setPinAnimating(animating: Boolean) {
@@ -514,6 +506,7 @@ class FreeformShellController {
                 root.translationY = 0f
                 root.alpha = 1f
             }
+            updateBottomInput()
         }
 
         fun applyVisualFrame(frame: FreeformPolicy.WindowVisualFrame) {
@@ -527,6 +520,7 @@ class FreeformShellController {
             root.translationX = frame.centerX - bounds.exactCenterX()
             root.translationY = frame.centerY - bounds.exactCenterY()
             root.alpha = frame.alpha
+            updateBottomInput()
         }
 
         fun update(newState: FreeformTaskState) {
@@ -565,6 +559,9 @@ class FreeformShellController {
         }
 
         fun detach() {
+            val wasAttached = attached
+            attached = false
+            bottomInput.detach()
             cancelPendingMiniTap()
             hideHandleMenu()
             hideHotIndicator()
@@ -572,9 +569,8 @@ class FreeformShellController {
             velocityTracker = null
             liveResizeBase = null
             uninstallTouchableRegion()
-            if (!attached) return
+            if (!wasAttached) return
             runCatching { wm.removeView(root) }
-            attached = false
         }
 
         private fun applyBounds(bounds: Rect) {
@@ -590,6 +586,7 @@ class FreeformShellController {
             )
             // Recompute touchable holes after geometry change.
             root.invalidate()
+            updateBottomInput()
         }
 
         private fun baseLayoutParams(): WindowManager.LayoutParams {
@@ -741,7 +738,7 @@ class FreeformShellController {
                     val cancelled = ev.actionMasked == MotionEvent.ACTION_CANCEL
                     if (!cancelled) {
                         settle(dx, dy, vx, vy)
-                    } else {
+                    } else if (mode != MODE_BOTTOM) {
                         // Keep the current leash transform until the single authoritative commit;
                         // resetting it first would flash the full-size source for one frame.
                         liveMove(Rect(startBounds), commit = true)
@@ -1028,6 +1025,7 @@ class FreeformShellController {
             runCatching {
                 wm.addView(menu, lp)
                 handleMenuAttached = true
+                updateBottomInput()
                 caption.flash()
                 XLog.i("handle-menu show task=${state.taskId} top=$topMargin landscape=$landscape")
             }.onFailure {
@@ -1048,6 +1046,7 @@ class FreeformShellController {
                 runCatching { wm.removeView(menu) }
                     .onFailure { XLog.e("handle-menu hide failed", it) }
             }
+            updateBottomInput()
             XLog.d("handle-menu hide task=${state.taskId}")
         }
 
