@@ -1132,19 +1132,19 @@ object HookSystem {
                 val cfg = XposedHelpers.getObjectField(merged, mf) ?: return@runCatching
                 val wc = XposedHelpers.getObjectField(cfg, "windowConfiguration") ?: return@runCatching
                 val mode = XposedHelpers.callMethod(wc, "getWindowingMode") as? Int
-                if (taskId != null && mode != null && mode in intArrayOf(
-                        FreeformPolicy.WINDOWING_MODE_FREEFORM,
-                        FreeformPolicy.WINDOWING_MODE_FULLSCREEN,
-                    )
-                ) {
-                    // A maximize removes the task from FreeformManagerService immediately after
-                    // switching WM to fullscreen. The queued client transaction can arrive a few
-                    // frames later; do not use freeformDpiOf(taskId) for that stale fullscreen
-                    // transaction. Only tracked freeform tasks get the custom-DPI path.
+                // Fullscreen snapshots include HOME and ordinary apps. Their activity override
+                // sequence is independent of the Task/global sequence; replacing them with the
+                // Task configuration makes later rotation updates look stale to ActivityThread.
+                if (mode != FreeformPolicy.WINDOWING_MODE_FREEFORM) return@runCatching
+                if (taskId != null) {
+                    // A queued FREEFORM snapshot can arrive after maximize has switched the
+                    // task to fullscreen and removed its tracking. Only that stale snapshot
+                    // needs restoration; current fullscreen configurations are already correct.
                     if (!managedFreeform) {
-                        if (runtimeTaskIsFreeform.not()) {
-                            replaceWithRuntimeTaskConfiguration(cfg, taskId)
-                            changed = true
+                        if (SystemServices.taskWindowingMode(taskId) ==
+                            FreeformPolicy.WINDOWING_MODE_FULLSCREEN
+                        ) {
+                            changed = replaceWithRuntimeTaskConfiguration(cfg, taskId) || changed
                         }
                         return@runCatching
                     }
@@ -1154,7 +1154,7 @@ object HookSystem {
                         FreeformManagerService.freeformBoundsOf(taskId),
                         appFullscreen = true,
                     ) || changed
-                } else if (taskId == null && mode == FreeformPolicy.WINDOWING_MODE_FREEFORM) {
+                } else {
                     injectConfiguredDpi(cfg, dpi)
                     XposedHelpers.callMethod(wc, "setWindowingMode", 1)
                     changed = true
@@ -1187,9 +1187,17 @@ object HookSystem {
             if (!cfgClz.isInstance(cfg)) return
             val winCfg = XposedHelpers.getObjectField(cfg, "windowConfiguration") ?: return
             val mode = XposedHelpers.callMethod(winCfg, "getWindowingMode") as? Int
+            // Check the outgoing snapshot BEFORE consulting the runtime Task. In particular,
+            // never replace a fullscreen LaunchActivityItem's global/override configurations:
+            // doing so copies the Task seq into the activity override and prevents HOME from
+            // accepting the smaller activity seq when a landscape app returns to portrait.
+            if (mode != FreeformPolicy.WINDOWING_MODE_FREEFORM) return
             if (taskId != null && SystemServices.taskWindowingMode(taskId) !=
                 FreeformPolicy.WINDOWING_MODE_FREEFORM
             ) {
+                if (SystemServices.taskWindowingMode(taskId) !=
+                    FreeformPolicy.WINDOWING_MODE_FULLSCREEN
+                ) return
                 // The item can have been built before maximize and queued after the task is
                 // already fullscreen. Replace that stale snapshot with the runtime task config;
                 // this restores the display density without any package/device special case.
@@ -1199,7 +1207,6 @@ object HookSystem {
                 }
                 return
             }
-            if (mode != FreeformPolicy.WINDOWING_MODE_FREEFORM) return
             if (taskId != null && !FreeformManagerService.isVisibleFreeformTask(taskId)) return
             val clone = cfgClz.getConstructor(cfgClz).newInstance(cfg)
             if (taskId != null) {
@@ -1228,7 +1235,7 @@ object HookSystem {
         }
     }
 
-    /** Copy the task's current resolved configuration into a queued independent config object. */
+    /** Restore a stale freeform snapshot after maximize, retaining its delivery sequence. */
     private fun replaceWithRuntimeTaskConfiguration(config: Any, taskId: Int): Boolean {
         val runtime = SystemServices.taskConfiguration(taskId) ?: return false
         return runCatching {
@@ -1236,7 +1243,10 @@ object HookSystem {
                 it.name == "setTo" && it.parameterTypes.size == 1 &&
                     it.parameterTypes[0].isAssignableFrom(runtime.javaClass)
             } ?: return@runCatching false
+            val seqField = config.javaClass.getField("seq")
+            val deliverySeq = seqField.getInt(config)
             setTo.invoke(config, runtime)
+            seqField.setInt(config, deliverySeq)
             if (restoredRuntimeConfigLoggedTasks.add(taskId)) {
                 val density = runtime.javaClass.getField("densityDpi").getInt(runtime)
                 val wc = XposedHelpers.getObjectField(runtime, "windowConfiguration")

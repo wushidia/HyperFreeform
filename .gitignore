@@ -21,6 +21,8 @@ signing.properties
 .externalNativeBuild/
 .cxx/
 captures/
+Pictures/
+__pycache__/
 
 # Packaged artifacts and local OS files
 *.apk
